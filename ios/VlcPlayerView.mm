@@ -12,19 +12,25 @@ extern "C" {
 typedef struct libvlc_media_player_t  libvlc_media_player_t;
 typedef struct libvlc_event_manager_t libvlc_event_manager_t;
 
+typedef int64_t libvlc_time_t;
+
 typedef struct libvlc_event_t {
     int   type;
     void *p_obj;
     union {
         struct { float new_cache; } media_player_buffering;
+        struct { libvlc_time_t new_time; } media_player_time_changed;
+        struct { libvlc_time_t new_length; } media_player_length_changed;
     } u;
 } libvlc_event_t;
 
 typedef void (*libvlc_callback_t)(const libvlc_event_t *, void *);
 
 enum {
-    libvlc_MediaPlayerBuffering = 0x103,
-    libvlc_MediaPlayerStopping  = 0x109,
+    libvlc_MediaPlayerBuffering     = 0x103,
+    libvlc_MediaPlayerStopping      = 0x109,
+    libvlc_MediaPlayerTimeChanged   = 0x10b,
+    libvlc_MediaPlayerLengthChanged = 0x111,
 };
 
 extern libvlc_event_manager_t *libvlc_media_player_event_manager(libvlc_media_player_t *p_mi);
@@ -68,7 +74,6 @@ static const NSTimeInterval kVLCOpeningTimeout = 8.0;
 
 static const NSTimeInterval kVLCBackgroundResumeThreshold = 5.0;
 static const NSTimeInterval kVLCResumeFallbackDelay = 2.0;
-static const NSTimeInterval kVLCProgressInterval = 0.5;
 
 typedef NS_ENUM(NSInteger, VlcPlayerResizeMode) {
   VlcPlayerResizeModeContain,
@@ -171,6 +176,8 @@ static libvlc_media_player_t *VLCRawMediaPlayer(VLCMediaPlayer *player)
 @class VlcPlayerView;
 @interface VlcPlayerView (VLCEventHandler)
 - (void)handleLibVLCBufferingPercent:(float)percent;
+- (void)handleLibVLCTimeChanged:(int64_t)timeMs;
+- (void)handleLibVLCLengthChanged:(int64_t)lengthMs;
 - (void)handleLibVLCStopping;
 @end
 
@@ -187,6 +194,20 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
       float cache = event->u.media_player_buffering.new_cache;
       dispatch_async(dispatch_get_main_queue(), ^{
         [weakView handleLibVLCBufferingPercent:cache];
+      });
+      break;
+    }
+    case libvlc_MediaPlayerTimeChanged: {
+      int64_t timeMs = (int64_t)event->u.media_player_time_changed.new_time;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [weakView handleLibVLCTimeChanged:timeMs];
+      });
+      break;
+    }
+    case libvlc_MediaPlayerLengthChanged: {
+      int64_t lengthMs = (int64_t)event->u.media_player_length_changed.new_length;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        [weakView handleLibVLCLengthChanged:lengthMs];
       });
       break;
     }
@@ -266,7 +287,9 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   dispatch_block_t _openingTimeoutBlock;
   dispatch_block_t _resumeFallbackBlock;
 
-  NSTimer *_progressTimer;
+  // Cached at emitLoadIfReady so the libvlc time-changed handler can compute
+  // percent without touching `_mediaPlayer.media` (which races with media swaps).
+  int64_t _loadedDurationMs;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -330,7 +353,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _desiredURL = nil;
   _backgroundDate = nil;
 
-  [self stopProgressTimer];
   [self removeLifecycleObservers];
   [self releasePlayer];
 }
@@ -545,10 +567,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     if (rawPlayer != NULL) {
       libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
       void *userData = (__bridge void *)self;
-      libvlc_event_attach(em, libvlc_MediaPlayerBuffering, VLCEventCallback, userData);
-      libvlc_event_attach(em, libvlc_MediaPlayerStopping,  VLCEventCallback, userData);
+      libvlc_event_attach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
+      libvlc_event_attach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
+      libvlc_event_attach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
+      libvlc_event_attach(em, libvlc_MediaPlayerStopping,      VLCEventCallback, userData);
     } else {
-      RCTLogWarn(@"VlcPlayerView: VLCMediaPlayer._playerInstance unavailable — buffering/end-of-stream signals degraded");
+      RCTLogWarn(@"VlcPlayerView: VLCMediaPlayer._playerInstance unavailable — buffering/progress/end-of-stream signals degraded");
     }
 
     _mediaPlayer = player;
@@ -572,12 +596,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
 
   [self invalidatePendingPlayback];
-  [self stopProgressTimer];
   _loadedURL = nil;
   _loadedMediaOptions = nil;
   _hasEmittedLoad = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
+  _loadedDurationMs = 0;
 
   @try {
     if (player.media != nil) {
@@ -631,7 +655,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     return;
   }
   [self invalidatePendingPlayback];
-  [self stopProgressTimer];
   [_mediaPlayer pause];
   _appliedPaused = YES;
 }
@@ -669,7 +692,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
 
   [self invalidatePendingPlayback];
-  [self stopProgressTimer];
 
   VLCMediaPlayer *player = _mediaPlayer;
   _mediaPlayer = nil;
@@ -679,6 +701,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _hasEmittedLoad = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
+  _loadedDurationMs = 0;
   _appliedPaused = YES;
 
   if (player == nil) {
@@ -694,8 +717,10 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   if (rawPlayer != NULL) {
     libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
     void *userData = (__bridge void *)self;
-    libvlc_event_detach(em, libvlc_MediaPlayerBuffering, VLCEventCallback, userData);
-    libvlc_event_detach(em, libvlc_MediaPlayerStopping,  VLCEventCallback, userData);
+    libvlc_event_detach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
+    libvlc_event_detach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
+    libvlc_event_detach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
+    libvlc_event_detach(em, libvlc_MediaPlayerStopping,      VLCEventCallback, userData);
   }
 
   @try {
@@ -806,49 +831,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
 }
 
-#pragma mark - Progress timer
-
-- (void)startProgressTimer
-{
-  if (_progressTimer != nil) return;
-  __weak __typeof(self) weakSelf = self;
-  _progressTimer = [NSTimer scheduledTimerWithTimeInterval:kVLCProgressInterval
-                                                   repeats:YES
-                                                     block:^(NSTimer *_Nonnull timer) {
-    __strong __typeof(weakSelf) strongSelf = weakSelf;
-    if (strongSelf == nil || strongSelf->_destroyed) {
-      [timer invalidate];
-      return;
-    }
-    [strongSelf tickProgress];
-  }];
-}
-
-- (void)stopProgressTimer
-{
-  if (_progressTimer != nil) {
-    [_progressTimer invalidate];
-    _progressTimer = nil;
-  }
-}
-
-- (void)tickProgress
-{
-  VLCMediaPlayer *player = _mediaPlayer;
-  if (player == nil || player.state != VLCMediaPlayerStatePlaying) {
-    return;
-  }
-  // Strong-ref: media can be swapped under us mid-reload.
-  VLCMedia *media = player.media;
-  if (media == nil) return;
-
-  int64_t durationMs = (int64_t)media.length.intValue;
-  if (durationMs <= 0) return;  // live stream
-  int64_t currentMs = (int64_t)player.time.intValue;
-  float percent = (float)(((double)currentMs / (double)durationMs) * 100.0);
-  [self emitProgressCurrentTime:currentMs duration:durationMs percent:percent];
-}
-
 #pragma mark - Timeouts
 
 - (void)scheduleOpeningTimeoutForGeneration:(NSUInteger)generation
@@ -950,7 +932,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
 
   [self invalidatePendingPlayback];
-  [self stopProgressTimer];
   _appliedPaused = YES;
   _backgroundDate = [NSDate date];
 
@@ -1000,6 +981,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   if (durationMs <= 0 && (videoW == 0 || videoH == 0)) return;
 
   _hasEmittedLoad = YES;
+  _loadedDurationMs = durationMs > 0 ? durationMs : 0;
   // Real video size is known now; cover's scale depends on it.
   [self applyDisplayOptions];
   auto emitter = [self eventEmitter];
@@ -1119,13 +1101,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
         }
         [strongSelf emitLoadIfReady];
         [strongSelf emitPlayingForURL:strongSelf->_loadedURL];
-        [strongSelf startProgressTimer];
         break;
       }
 
       case VLCMediaPlayerStatePaused:
       case VLCMediaPlayerStateStopped:
-        [strongSelf stopProgressTimer];
         if (strongSelf->_isBufferingState) {
           strongSelf->_isBufferingState = NO;
           [strongSelf emitBufferIsBuffering:NO percent:0.0f];
@@ -1174,11 +1154,39 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _hasEmittedEnd = YES;
 
   NSURL *url = _loadedURL;
+  // libvlc never delivers a TimeChanged at exactly `length` — VOD ends with
+  // time still short of the duration. Emit a synthetic 100% so consumers see
+  // a clean tail before onEnd.
+  if (_loadedDurationMs > 0) {
+    [self emitProgressCurrentTime:_loadedDurationMs duration:_loadedDurationMs percent:100.0f];
+  }
   [self emitEndForURL:url];
   if (_desiredRepeat && url != nil) {
     _loadedURL = nil;
     [self syncPlayer];
   }
+}
+
+// libvlc event thread → main. Use cached duration to avoid the
+// `_mediaPlayer.media` race documented above.
+- (void)handleLibVLCTimeChanged:(int64_t)timeMs
+{
+  if (_destroyed) return;
+  if (_mediaPlayer == nil) return;
+  int64_t durationMs = _loadedDurationMs;
+  if (durationMs <= 0) return;  // live stream or pre-load
+  int64_t safeTime = timeMs < 0 ? 0 : timeMs;
+  float percent = (float)(((double)safeTime / (double)durationMs) * 100.0);
+  [self emitProgressCurrentTime:safeTime duration:durationMs percent:percent];
+}
+
+// Refresh the duration cache. Fires after onLoad if dimensions arrived
+// first (videoSize → onLoad with duration=0 → length resolves later),
+// and on DASH/HLS streams whose length grows during playback.
+- (void)handleLibVLCLengthChanged:(int64_t)lengthMs
+{
+  if (_destroyed) return;
+  _loadedDurationMs = lengthMs > 0 ? lengthMs : 0;
 }
 
 #pragma mark - Fabric registration

@@ -55,7 +55,6 @@ class VlcPlayerView @JvmOverloads constructor(
   private var resumeWhenActive: Boolean = false
   private var released: Boolean = false
   private var pendingApply: Boolean = false
-  private var progressRunnable: Runnable? = null
 
   // PNG encoding offloaded so cmdSnapshot doesn't block the UI thread.
   private val snapshotExecutor = Executors.newSingleThreadExecutor { r ->
@@ -232,7 +231,6 @@ class VlcPlayerView @JvmOverloads constructor(
     attachedToWindow = false
     resumeWhenActive = false
     pendingApply = false
-    stopProgressTimer()
     removeCallbacks(measureAndLayoutRunnable)
     ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
     playerSession?.release()
@@ -274,7 +272,6 @@ class VlcPlayerView @JvmOverloads constructor(
       playerSession?.pause()
       playerSession?.detach()
       attachedToWindow = false
-      stopProgressTimer()
     }
     super.onDetachedFromWindow()
   }
@@ -284,7 +281,6 @@ class VlcPlayerView @JvmOverloads constructor(
     resumeWhenActive = playerSession?.isPlaying() == true
     playerSession?.pause()
     playerSession?.detach()
-    stopProgressTimer()
   }
 
   override fun onStart(owner: LifecycleOwner) {
@@ -337,28 +333,6 @@ class VlcPlayerView @JvmOverloads constructor(
   private fun findInnerSurfaceView(): SurfaceView? =
     videoLayout.findViewById<android.view.View>(org.videolan.R.id.player_surface_frame)
       ?.findViewById<SurfaceView>(org.videolan.R.id.surface_video)
-
-  // ---- Progress timer ----
-
-  private fun startProgressTimer() {
-    if (progressRunnable != null) return
-    val r = object : Runnable {
-      override fun run() {
-        if (released) return
-        playerSession?.tickProgress()
-        // Re-post even if no emit happened — live streams flip from length=0
-        // to known length later.
-        postDelayed(this, PROGRESS_INTERVAL_MS)
-      }
-    }
-    progressRunnable = r
-    postDelayed(r, PROGRESS_INTERVAL_MS)
-  }
-
-  private fun stopProgressTimer() {
-    progressRunnable?.let { removeCallbacks(it) }
-    progressRunnable = null
-  }
 
   // ============================================================
   // Fabric direct-event dispatch
@@ -458,6 +432,7 @@ class VlcPlayerView @JvmOverloads constructor(
         MediaPlayer.Event.Playing -> handlePlaying()
         MediaPlayer.Event.Paused -> handlePaused()
         MediaPlayer.Event.Stopped -> handleStopped()
+        MediaPlayer.Event.TimeChanged -> handleTimeChanged(event.timeChanged)
         MediaPlayer.Event.EndReached -> handleEndReached()
         MediaPlayer.Event.EncounteredError -> handleError()
         MediaPlayer.Event.LengthChanged -> maybeEmitLoad()
@@ -490,26 +465,24 @@ class VlcPlayerView @JvmOverloads constructor(
         post { emitBuffer(isBuffering = false, percent = 100f) }
       }
       maybeEmitLoad()
-      post {
-        emitPlaying(uri)
-        startProgressTimer()
-      }
+      post { emitPlaying(uri) }
     }
 
-    private fun handlePaused() {
-      post { stopProgressTimer() }
-    }
+    private fun handlePaused() {}
 
     private fun handleStopped() {
       isBufferingState = false
-      post { stopProgressTimer() }
     }
 
+    // libvlc never delivers a TimeChanged at exactly `length` — VOD ends with
+    // time still short of the duration. Emit a synthetic 100% so consumers see
+    // a clean tail before onEnd.
     private fun handleEndReached() {
       isBufferingState = false
       val uri = loadedUri
+      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
       post {
-        stopProgressTimer()
+        if (length > 0L) emitProgress(length, length, 100f)
         emitEnd(uri)
         // libvlc 3.x leaves the player terminated after EndReached — seek-to-0
         // + play() doesn't work, only a full prepare() restarts cleanly.
@@ -523,9 +496,16 @@ class VlcPlayerView @JvmOverloads constructor(
       isBufferingState = false
       val uri = loadedUri
       post {
-        stopProgressTimer()
         emitError("VLC playback error" + (uri?.let { " for $it" } ?: ""))
       }
+    }
+
+    private fun handleTimeChanged(time: Long) {
+      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
+      if (length <= 0L) return  // live stream — no meaningful progress
+      val safeTime = time.coerceAtLeast(0L)
+      val percent = (safeTime.toFloat() / length * 100f).coerceIn(0f, 100f)
+      post { emitProgress(safeTime, length, percent) }
     }
 
     private fun maybeEmitLoad() {
@@ -631,16 +611,6 @@ class VlcPlayerView @JvmOverloads constructor(
     fun isPlaying(): Boolean =
       runCatching { mediaPlayer.isPlaying }.getOrDefault(false)
 
-    /** Reads time/length/state and emits onProgress; called every 500ms. */
-    fun tickProgress() {
-      if (!isPlaying()) return
-      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
-      if (length <= 0L) return  // live stream — no meaningful progress
-      val time = runCatching { mediaPlayer.time }.getOrDefault(0L)
-      val percent = (time.toFloat() / length * 100f).coerceIn(0f, 100f)
-      emitProgress(time, length, percent)
-    }
-
     fun release() {
       stop()
       detach()
@@ -675,6 +645,5 @@ class VlcPlayerView @JvmOverloads constructor(
 
   private companion object {
     private const val TAG = "VlcPlayerView"
-    private const val PROGRESS_INTERVAL_MS = 500L
   }
 }

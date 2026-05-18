@@ -60,6 +60,15 @@ const RESIZE_MODES: VlcPlayerResizeMode[] = [
 ];
 
 type EventLog = { ts: string; kind: string; data: string };
+type Progress = { currentTime: number; duration: number; percent: number };
+
+const fmtTime = (ms: number) => {
+  if (!Number.isFinite(ms) || ms < 0) return '--:--';
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
 
 export default function App() {
   const ref = useRef<VlcPlayerHandle>(null);
@@ -70,6 +79,12 @@ export default function App() {
   const [resizeMode, setResizeMode] = useState<VlcPlayerResizeMode>('contain');
   const [logs, setLogs] = useState<EventLog[]>([]);
   const [snapshotData, setSnapshotData] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Progress>({
+    currentTime: 0,
+    duration: 0,
+    percent: 0,
+  });
+  const lastLoggedDecileRef = useRef<number>(-1);
 
   const source = SOURCES[sourceIdx]!;
 
@@ -89,6 +104,8 @@ export default function App() {
     setPaused(false);
     setSnapshotData(null);
     setLogs([]);
+    setProgress({ currentTime: 0, duration: 0, percent: 0 });
+    lastLoggedDecileRef.current = -1;
   };
 
   return (
@@ -148,14 +165,15 @@ export default function App() {
             }
           }}
           onProgress={({ nativeEvent: { currentTime, duration, percent } }) => {
-            // 只记录关键点,不刷屏
-            if (
-              Math.floor(percent) % 10 === 0 &&
-              Math.floor(percent) !== Math.floor((percent - 0.5) % 10)
-            ) {
+            console.log('onProgress', { currentTime, duration, percent });
+            setProgress({ currentTime, duration, percent });
+            // 每 10% 只记录一次,避免刷屏
+            const decile = Math.floor(percent / 10);
+            if (decile !== lastLoggedDecileRef.current) {
+              lastLoggedDecileRef.current = decile;
               log(
                 'onProgress',
-                `${currentTime}/${duration} (${percent.toFixed(0)}%)`
+                `${fmtTime(currentTime)}/${fmtTime(duration)} (${percent.toFixed(1)}%)`
               );
             }
           }}
@@ -172,6 +190,25 @@ export default function App() {
             <Text style={styles.loaderText}>{bufferPct.toFixed(0)}%</Text>
           </View>
         )}
+      </View>
+
+      {/* ---- onProgress 实时显示 ---- */}
+      <View style={styles.progressBox}>
+        <View style={styles.progressRow}>
+          <Text style={styles.progressTime}>
+            {fmtTime(progress.currentTime)}
+          </Text>
+          <Text style={styles.progressPct}>{progress.percent.toFixed(1)}%</Text>
+          <Text style={styles.progressTime}>{fmtTime(progress.duration)}</Text>
+        </View>
+        <View style={styles.progressBar}>
+          <View
+            style={[
+              styles.progressBarFill,
+              { width: `${Math.max(0, Math.min(100, progress.percent))}%` },
+            ]}
+          />
+        </View>
       </View>
 
       {/* ---- resize modes ---- */}
@@ -292,6 +329,31 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   loaderText: { color: 'white', marginTop: 8, fontSize: 14 },
+  progressBox: {
+    paddingHorizontal: 12,
+    paddingTop: 8,
+  },
+  progressRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  progressTime: { color: '#aaa', fontSize: 12, fontVariant: ['tabular-nums'] },
+  progressPct: {
+    color: '#4fc3f7',
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+  },
+  progressBar: {
+    height: 3,
+    backgroundColor: '#222',
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: '#1e88e5',
+  },
   row: {
     flexDirection: 'row',
     paddingHorizontal: 12,
