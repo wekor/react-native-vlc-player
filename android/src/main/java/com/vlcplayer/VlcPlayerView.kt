@@ -1,0 +1,680 @@
+package com.vlcplayer
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.util.AttributeSet
+import android.util.Base64
+import android.util.Log
+import android.view.PixelCopy
+import android.view.SurfaceView
+import android.widget.FrameLayout
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.UIManagerHelper
+import com.facebook.react.uimanager.events.Event
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
+
+class VlcPlayerView @JvmOverloads constructor(
+  context: Context,
+  attrs: AttributeSet? = null,
+  defStyleAttr: Int = 0,
+) : FrameLayout(context, attrs, defStyleAttr), DefaultLifecycleObserver {
+
+  // VLCVideoLayout as a child, not `this` — VLCVideoLayout.onAttachedToWindow
+  // force-resets LayoutParams to MATCH_PARENT, which fights Fabric if we
+  // inherit it directly.
+  private val videoLayout = VLCVideoLayout(context).also {
+    addView(it, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+  }
+
+  // Desired state (driven by props)
+  private var currentUri: Uri? = null
+  private var desiredInitOptions: List<String> = emptyList()
+  private var desiredMediaOptions: List<String> = emptyList()
+  private var desiredResizeMode: ResizeMode = ResizeMode.CONTAIN
+  private var shouldPlayWhenReady: Boolean = true
+  private var desiredMuted: Boolean = false
+  private var desiredVolume: Float = 1f
+  private var desiredRepeat: Boolean = false
+
+  // Internal state
+  private var playerSession: PlayerSession? = null
+  private var attachedToWindow: Boolean = false
+  private var resumeWhenActive: Boolean = false
+  private var released: Boolean = false
+  private var pendingApply: Boolean = false
+  private var progressRunnable: Runnable? = null
+
+  // PNG encoding offloaded so cmdSnapshot doesn't block the UI thread.
+  private val snapshotExecutor = Executors.newSingleThreadExecutor { r ->
+    Thread(r, "VlcPlayerView-Snapshot").apply { isDaemon = true }
+  }
+  // Reused by PixelCopy.request to avoid a Handler alloc per snapshot.
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  init {
+    ProcessLifecycleOwner.get().lifecycle.addObserver(this)
+  }
+
+  // Fabric's ReactViewGroup swallows requestLayout; libvlc's programmatically-
+  // added SurfaceView would never receive a size and play() would stall in
+  // areSurfacesWaiting. Pump a manual measure/layout on every requestLayout.
+  private val measureAndLayoutRunnable = Runnable {
+    measure(
+      MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+      MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY),
+    )
+    layout(left, top, right, bottom)
+  }
+
+  override fun requestLayout() {
+    super.requestLayout()
+    removeCallbacks(measureAndLayoutRunnable)
+    post(measureAndLayoutRunnable)
+  }
+
+  // ============================================================
+  // Prop setters (called from VlcPlayerViewManager)
+  // ============================================================
+
+  fun setStreamUrl(url: String?) {
+    if (released) return
+    val resolved = parseStreamUri(url)
+    if (resolved == currentUri) return
+    currentUri = resolved
+    pendingApply = true
+  }
+
+  fun setInitOptions(options: List<String>?) {
+    if (released) return
+    val resolved = options ?: emptyList()
+    if (resolved == desiredInitOptions) return
+    desiredInitOptions = resolved
+    if (currentUri != null) pendingApply = true
+  }
+
+  fun setMediaOptions(options: List<String>?) {
+    if (released) return
+    val resolved = options ?: emptyList()
+    if (resolved == desiredMediaOptions) return
+    desiredMediaOptions = resolved
+    if (currentUri != null) pendingApply = true
+  }
+
+  fun setPausedState(paused: Boolean) {
+    if (released) return
+    val newShould = !paused
+    if (newShould == shouldPlayWhenReady) return
+    shouldPlayWhenReady = newShould
+    if (paused) {
+      playerSession?.pause()
+    } else if (attachedToWindow && currentUri != null) {
+      playerSession?.playWhenReady()
+    }
+  }
+
+  fun setMutedState(muted: Boolean) {
+    if (released || muted == desiredMuted) return
+    desiredMuted = muted
+    applyVolumeAndMute()
+  }
+
+  fun setVolumeLevel(volume: Float) {
+    if (released) return
+    val coerced = volume.coerceIn(0f, 1f)
+    if (coerced == desiredVolume) return
+    desiredVolume = coerced
+    applyVolumeAndMute()
+  }
+
+  fun setRepeatMode(repeat: Boolean) {
+    if (released) return
+    desiredRepeat = repeat
+  }
+
+  fun setResizeMode(mode: String?) {
+    if (released) return
+    val resolved = ResizeMode.fromValue(mode)
+    if (resolved == desiredResizeMode) return
+    desiredResizeMode = resolved
+    playerSession?.applyResizeMode(resolved)
+  }
+
+  // ============================================================
+  // Commands (called from VlcPlayerViewManager.receiveCommand)
+  // ============================================================
+
+  fun cmdPlay() {
+    if (released) return
+    shouldPlayWhenReady = true
+    if (attachedToWindow && currentUri != null) {
+      playerSession?.playWhenReady()
+    }
+  }
+
+  fun cmdPause() {
+    if (released) return
+    shouldPlayWhenReady = false
+    playerSession?.pause()
+  }
+
+  fun cmdSeek(seconds: Double) {
+    if (released) return
+    val ms = (seconds * 1000.0).toLong().coerceAtLeast(0L)
+    playerSession?.seekTo(ms)
+  }
+
+  fun cmdReload() {
+    if (released || currentUri == null) return
+    shouldPlayWhenReady = true
+    playerSession?.release()
+    playerSession = null
+    pendingApply = true
+    applyPendingChanges()
+  }
+
+  fun cmdSnapshot(callId: Int) {
+    if (released) {
+      emitSnapshotResult(callId, base64 = null, error = "View released")
+      return
+    }
+    val surfaceView = findInnerSurfaceView()
+    if (surfaceView == null || surfaceView.width == 0 || surfaceView.height == 0) {
+      emitSnapshotResult(callId, base64 = null, error = "Video surface not ready")
+      return
+    }
+    // SurfaceView pixels live on a Surface owned by SurfaceFlinger; PixelCopy
+    // is the only public API to read them back.
+    val frame = Bitmap.createBitmap(surfaceView.width, surfaceView.height, Bitmap.Config.ARGB_8888)
+    PixelCopy.request(surfaceView, frame, { result ->
+      if (result == PixelCopy.SUCCESS) {
+        encodeSnapshotAsync(callId, frame)
+      } else {
+        frame.recycle()
+        emitSnapshotResult(callId, base64 = null, error = "PixelCopy failed: $result")
+      }
+    }, mainHandler)
+  }
+
+  private fun encodeSnapshotAsync(callId: Int, frame: Bitmap) {
+    snapshotExecutor.execute {
+      val result = runCatching {
+        val bos = ByteArrayOutputStream(frame.width * frame.height / 2)
+        frame.compress(Bitmap.CompressFormat.PNG, 100, bos)
+        Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+      }
+      frame.recycle()
+      post {
+        result.fold(
+          onSuccess = { emitSnapshotResult(callId, base64 = it, error = null) },
+          onFailure = { emitSnapshotResult(callId, base64 = null, error = it.message ?: "Snapshot encoding failed") },
+        )
+      }
+    }
+  }
+
+  fun release() {
+    if (released) return
+    released = true
+    shouldPlayWhenReady = false
+    attachedToWindow = false
+    resumeWhenActive = false
+    pendingApply = false
+    stopProgressTimer()
+    removeCallbacks(measureAndLayoutRunnable)
+    ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
+    playerSession?.release()
+    playerSession = null
+    currentUri = null
+    snapshotExecutor.shutdown()
+  }
+
+  /** Called from `onAfterUpdateTransaction` after a batch of prop changes. */
+  fun applyPendingChanges() {
+    if (released || !pendingApply) return
+    pendingApply = false
+    val uri = currentUri
+    if (uri == null) {
+      playerSession?.stop()
+      playerSession?.release()
+      playerSession = null
+      return
+    }
+    ensureSession().prepare(uri, autoPlay = shouldPlayWhenReady)
+  }
+
+  // ============================================================
+  // View lifecycle
+  // ============================================================
+
+  override fun onAttachedToWindow() {
+    super.onAttachedToWindow()
+    if (released) return
+    attachedToWindow = true
+    playerSession?.attach(videoLayout)
+    if (shouldPlayWhenReady && currentUri != null) {
+      playerSession?.playWhenReady()
+    }
+  }
+
+  override fun onDetachedFromWindow() {
+    if (!released) {
+      playerSession?.pause()
+      playerSession?.detach()
+      attachedToWindow = false
+      stopProgressTimer()
+    }
+    super.onDetachedFromWindow()
+  }
+
+  override fun onStop(owner: LifecycleOwner) {
+    if (released) return
+    resumeWhenActive = playerSession?.isPlaying() == true
+    playerSession?.pause()
+    playerSession?.detach()
+    stopProgressTimer()
+  }
+
+  override fun onStart(owner: LifecycleOwner) {
+    if (released) return
+    if (attachedToWindow) {
+      playerSession?.attach(videoLayout)
+    }
+    val shouldResume = resumeWhenActive || shouldPlayWhenReady
+    resumeWhenActive = false
+    if (shouldResume && attachedToWindow && currentUri != null) {
+      playerSession?.playWhenReady()
+    }
+  }
+
+  // ============================================================
+  // Internal helpers
+  // ============================================================
+
+  private fun parseStreamUri(url: String?): Uri? {
+    val normalized = url?.trim().orEmpty()
+    if (normalized.isEmpty()) return null
+    val uri = runCatching { Uri.parse(normalized) }.getOrNull() ?: return null
+    if (uri.scheme.isNullOrEmpty()) return null
+    return uri
+  }
+
+  private fun ensureSession(): PlayerSession {
+    val existing = playerSession
+    if (existing != null && existing.matches(desiredInitOptions, desiredMediaOptions)) {
+      return existing
+    }
+    existing?.release()
+    val fresh = PlayerSession(context, desiredInitOptions, desiredMediaOptions)
+    fresh.applyResizeMode(desiredResizeMode)
+    fresh.applyVolume(effectiveVolumeInt())
+    if (attachedToWindow) {
+      fresh.attach(videoLayout)
+    }
+    playerSession = fresh
+    return fresh
+  }
+
+  private fun effectiveVolumeInt(): Int =
+    if (desiredMuted) 0 else (desiredVolume * 100f).toInt().coerceIn(0, 100)
+
+  private fun applyVolumeAndMute() {
+    playerSession?.applyVolume(effectiveVolumeInt())
+  }
+
+  private fun findInnerSurfaceView(): SurfaceView? =
+    videoLayout.findViewById<android.view.View>(org.videolan.R.id.player_surface_frame)
+      ?.findViewById<SurfaceView>(org.videolan.R.id.surface_video)
+
+  // ---- Progress timer ----
+
+  private fun startProgressTimer() {
+    if (progressRunnable != null) return
+    val r = object : Runnable {
+      override fun run() {
+        if (released) return
+        playerSession?.tickProgress()
+        // Re-post even if no emit happened — live streams flip from length=0
+        // to known length later.
+        postDelayed(this, PROGRESS_INTERVAL_MS)
+      }
+    }
+    progressRunnable = r
+    postDelayed(r, PROGRESS_INTERVAL_MS)
+  }
+
+  private fun stopProgressTimer() {
+    progressRunnable?.let { removeCallbacks(it) }
+    progressRunnable = null
+  }
+
+  // ============================================================
+  // Fabric direct-event dispatch
+  // ============================================================
+
+  private fun emitLoad(duration: Long, videoWidth: Int, videoHeight: Int) {
+    val map = Arguments.createMap().apply {
+      putInt("duration", duration.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt())
+      putInt("videoWidth", videoWidth)
+      putInt("videoHeight", videoHeight)
+    }
+    emitEvent("topLoad", map)
+  }
+
+  private fun emitPlaying(uri: Uri?) {
+    val map = Arguments.createMap().apply { putString("url", uri?.toString() ?: "") }
+    emitEvent("topPlaying", map)
+  }
+
+  private fun emitBuffer(isBuffering: Boolean, percent: Float) {
+    val map = Arguments.createMap().apply {
+      putBoolean("isBuffering", isBuffering)
+      putDouble("percent", percent.coerceIn(0f, 100f).toDouble())
+    }
+    emitEvent("topBuffer", map)
+  }
+
+  private fun emitProgress(currentTime: Long, duration: Long, percent: Float) {
+    val map = Arguments.createMap().apply {
+      putInt("currentTime", currentTime.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt())
+      putInt("duration", duration.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt())
+      putDouble("percent", percent.coerceIn(0f, 100f).toDouble())
+    }
+    emitEvent("topProgress", map)
+  }
+
+  private fun emitEnd(uri: Uri?) {
+    val map = Arguments.createMap().apply { putString("url", uri?.toString() ?: "") }
+    emitEvent("topEnd", map)
+  }
+
+  private fun emitError(message: String) {
+    Log.w(TAG, "emitError: $message")
+    val map = Arguments.createMap().apply { putString("message", message) }
+    emitEvent("topError", map)
+  }
+
+  private fun emitSnapshotResult(callId: Int, base64: String?, error: String?) {
+    val map = Arguments.createMap().apply {
+      putInt("callId", callId)
+      putString("base64", base64 ?: "")
+      putString("error", error ?: "")
+    }
+    emitEvent("topSnapshotResult", map)
+  }
+
+  private fun emitEvent(eventName: String, payload: WritableMap) {
+    val reactContext = context as? ReactContext ?: return
+    val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
+    val surfaceId = UIManagerHelper.getSurfaceId(this)
+    dispatcher.dispatchEvent(VlcEvent(surfaceId, id, eventName, payload))
+  }
+
+  private class VlcEvent(
+    surfaceId: Int,
+    viewTag: Int,
+    private val name: String,
+    private val data: WritableMap,
+  ) : Event<VlcEvent>(surfaceId, viewTag) {
+    override fun getEventName(): String = name
+    override fun getEventData(): WritableMap = data
+  }
+
+  // ============================================================
+  // PlayerSession
+  // ============================================================
+
+  private inner class PlayerSession(
+    context: Context,
+    private val initOptions: List<String>,
+    private val mediaOptions: List<String>,
+  ) {
+    private val libVlc = LibVLC(context.applicationContext, ArrayList(initOptions))
+    private val mediaPlayer = MediaPlayer(libVlc)
+
+    private var attached = false
+    private var playWhenAttached = false
+    private var loadedUri: Uri? = null
+
+    // Mutated on libvlc's event thread, read on the UI thread.
+    @Volatile private var isBufferingState: Boolean = false
+    @Volatile private var hasEmittedLoad: Boolean = false
+
+    private val eventListener = MediaPlayer.EventListener { event ->
+      when (event.type) {
+        MediaPlayer.Event.Buffering -> handleBuffering(event.buffering)
+        MediaPlayer.Event.Playing -> handlePlaying()
+        MediaPlayer.Event.Paused -> handlePaused()
+        MediaPlayer.Event.Stopped -> handleStopped()
+        MediaPlayer.Event.EndReached -> handleEndReached()
+        MediaPlayer.Event.EncounteredError -> handleError()
+        MediaPlayer.Event.LengthChanged -> maybeEmitLoad()
+        MediaPlayer.Event.Vout -> {
+          if (event.voutCount > 0) maybeEmitLoad()
+        }
+      }
+    }
+
+    init {
+      mediaPlayer.setEventListener(eventListener)
+    }
+
+    // ---- libvlc event handlers ----
+
+    private fun handleBuffering(percent: Float) {
+      if (percent < 100f) {
+        isBufferingState = true
+        post { emitBuffer(isBuffering = true, percent = percent) }
+      } else if (isBufferingState) {
+        isBufferingState = false
+        post { emitBuffer(isBuffering = false, percent = 100f) }
+      }
+    }
+
+    private fun handlePlaying() {
+      val uri = loadedUri
+      if (isBufferingState) {
+        isBufferingState = false
+        post { emitBuffer(isBuffering = false, percent = 100f) }
+      }
+      maybeEmitLoad()
+      post {
+        emitPlaying(uri)
+        startProgressTimer()
+      }
+    }
+
+    private fun handlePaused() {
+      post { stopProgressTimer() }
+    }
+
+    private fun handleStopped() {
+      isBufferingState = false
+      post { stopProgressTimer() }
+    }
+
+    private fun handleEndReached() {
+      isBufferingState = false
+      val uri = loadedUri
+      post {
+        stopProgressTimer()
+        emitEnd(uri)
+        // libvlc 3.x leaves the player terminated after EndReached — seek-to-0
+        // + play() doesn't work, only a full prepare() restarts cleanly.
+        if (desiredRepeat && uri != null && attachedToWindow && !released) {
+          ensureSession().prepare(uri, autoPlay = true)
+        }
+      }
+    }
+
+    private fun handleError() {
+      isBufferingState = false
+      val uri = loadedUri
+      post {
+        stopProgressTimer()
+        emitError("VLC playback error" + (uri?.let { " for $it" } ?: ""))
+      }
+    }
+
+    private fun maybeEmitLoad() {
+      if (hasEmittedLoad) return
+      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
+      val track = runCatching { mediaPlayer.currentVideoTrack }.getOrNull()
+      val w = track?.width ?: 0
+      val h = track?.height ?: 0
+      // Need duration (VOD) or dimensions (live) — otherwise payload is empty.
+      if (length <= 0L && (w == 0 || h == 0)) return
+      hasEmittedLoad = true
+      post { emitLoad(length, w, h) }
+    }
+
+    // ---- Public API ----
+
+    fun matches(init: List<String>, media: List<String>): Boolean =
+      initOptions == init && mediaOptions == media
+
+    fun prepare(uri: Uri, autoPlay: Boolean) {
+      loadedUri = uri
+      playWhenAttached = autoPlay
+      hasEmittedLoad = false
+      isBufferingState = false
+
+      runCatching {
+        if (mediaPlayer.isPlaying) mediaPlayer.stop()
+      }
+      mediaPlayer.media?.release()
+
+      val media = Media(libVlc, uri)
+      // User options must be added BEFORE setHWDecoderEnabled — the latter
+      // auto-injects `:network-caching=1500` / `:file-caching=1500` unless
+      // the flag is already set, which would shadow user-provided values.
+      mediaOptions.forEach(media::addOption)
+      // Safety net only: handleEndReached() actually drives repeat because
+      // libvlc 3.x's seamless input-repeat is unreliable.
+      if (desiredRepeat) media.addOption(":input-repeat=65535")
+      media.setHWDecoderEnabled(true, false)
+
+      mediaPlayer.media = media
+      media.release()
+
+      if (autoPlay && attached) {
+        playWhenReady()
+      }
+    }
+
+    fun playWhenReady() {
+      if (!attached) {
+        playWhenAttached = true
+        return
+      }
+      playWhenAttached = true
+      runCatching { mediaPlayer.play() }.onFailure { err ->
+        playWhenAttached = false
+        emitError(err.message ?: "Unable to start playback")
+      }
+    }
+
+    fun pause() {
+      playWhenAttached = false
+      runCatching { mediaPlayer.pause() }
+    }
+
+    fun stop() {
+      playWhenAttached = false
+      hasEmittedLoad = false
+      isBufferingState = false
+      runCatching { mediaPlayer.stop() }
+      mediaPlayer.media?.release()
+      mediaPlayer.media = null
+      loadedUri = null
+    }
+
+    fun seekTo(ms: Long) {
+      runCatching { mediaPlayer.time = ms }
+    }
+
+    fun attach(layout: VLCVideoLayout) {
+      if (attached) return
+      // attachViews(layout, dm, subtitles, useTextureView).
+      // Matches the official VLC for Android call: SurfaceView + subtitles=true.
+      mediaPlayer.attachViews(layout, null, true, false)
+      attached = true
+      if (playWhenAttached) playWhenReady()
+    }
+
+    fun detach() {
+      if (!attached) return
+      runCatching { mediaPlayer.detachViews() }
+      attached = false
+    }
+
+    fun applyResizeMode(mode: ResizeMode) {
+      runCatching { mediaPlayer.setVideoScale(mode.toScaleType()) }
+    }
+
+    fun applyVolume(volume: Int) {
+      runCatching { mediaPlayer.volume = volume.coerceIn(0, 100) }
+    }
+
+    fun isPlaying(): Boolean =
+      runCatching { mediaPlayer.isPlaying }.getOrDefault(false)
+
+    /** Reads time/length/state and emits onProgress; called every 500ms. */
+    fun tickProgress() {
+      if (!isPlaying()) return
+      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
+      if (length <= 0L) return  // live stream — no meaningful progress
+      val time = runCatching { mediaPlayer.time }.getOrDefault(0L)
+      val percent = (time.toFloat() / length * 100f).coerceIn(0f, 100f)
+      emitProgress(time, length, percent)
+    }
+
+    fun release() {
+      stop()
+      detach()
+      mediaPlayer.setEventListener(null)
+      mediaPlayer.release()
+      libVlc.release()
+    }
+  }
+
+  private enum class ResizeMode {
+    CONTAIN,
+    COVER,
+    STRETCH,
+    ORIGINAL;
+
+    fun toScaleType(): MediaPlayer.ScaleType = when (this) {
+      CONTAIN -> MediaPlayer.ScaleType.SURFACE_BEST_FIT
+      COVER -> MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
+      STRETCH -> MediaPlayer.ScaleType.SURFACE_FILL
+      ORIGINAL -> MediaPlayer.ScaleType.SURFACE_ORIGINAL
+    }
+
+    companion object {
+      fun fromValue(value: String?): ResizeMode = when (value?.lowercase()) {
+        "cover" -> COVER
+        "stretch" -> STRETCH
+        "original", "center" -> ORIGINAL
+        else -> CONTAIN
+      }
+    }
+  }
+
+  private companion object {
+    private const val TAG = "VlcPlayerView"
+    private const val PROGRESS_INTERVAL_MS = 500L
+  }
+}
