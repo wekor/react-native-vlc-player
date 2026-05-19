@@ -1,6 +1,6 @@
 {
   "name": "@wekor/react-native-vlc-player",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "React Native VLC video player for iOS and Android. Zero-config RTSP / RTMP / HLS / HTTP playback on Fabric.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
