@@ -8,7 +8,7 @@ iOS + Android 全能视频播放器，**一行代码就能播**。
 import { VlcPlayerView } from '@wekor/react-native-vlc-player';
 
 <VlcPlayerView
-  url="rtsp://192.168.1.10/live"
+  source="rtsp://192.168.1.10/live"
   style={{ flex: 1 }}
 />
 ```
@@ -33,7 +33,7 @@ cd ios && pod install
 ### 最简
 
 ```tsx
-<VlcPlayerView url={url} style={{ flex: 1 }} />
+<VlcPlayerView source={url} style={{ flex: 1 }} />
 ```
 
 ### 控制播放
@@ -42,7 +42,7 @@ cd ios && pod install
 const [paused, setPaused] = useState(false);
 
 <VlcPlayerView
-  url={url}
+  source={url}
   paused={paused}
   muted={isMuted}
   volume={0.8}
@@ -56,7 +56,7 @@ const [loading, setLoading] = useState(true);
 
 <View>
   <VlcPlayerView
-    url={url}
+    source={url}
     onBuffer={({ isBuffering }) => setLoading(isBuffering)}
   />
   {loading && <ActivityIndicator style={StyleSheet.absoluteFill} />}
@@ -71,7 +71,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 
 <VlcPlayerView
   ref={ref}
-  url={url}
+  source={url}
   onProgress={setProgress}
 />
 <Slider
@@ -86,7 +86,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 ```tsx
 const ref = useRef<VlcPlayerHandle>(null);
 
-<VlcPlayerView ref={ref} url={url} />
+<VlcPlayerView ref={ref} source={url} />
 <Button onPress={async () => {
   const base64Png = await ref.current?.snapshot();
   // 存盘 / 上传 / 显示
@@ -99,13 +99,14 @@ const ref = useRef<VlcPlayerHandle>(null);
 
 | Prop | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `url` | `string` | — | 视频地址（必填） |
+| `source` | `string \| { uri: string; referer?: string; userAgent?: string }` | — | 视频源（必填）。字符串等价于 `{ uri: ... }`；对象支持 `Referer` / `User-Agent`（libvlc 只能注入这两个 HTTP 头）。 |
 | `style` | `ViewStyle` | — | 标准 RN style |
 | `paused` | `boolean` | `false` | 暂停 |
 | `muted` | `boolean` | `false` | 静音 |
 | `volume` | `number` | `1` | 音量 0..1 |
 | `repeat` | `boolean` | `false` | 循环播放 |
 | `resizeMode` | `'contain' \| 'cover' \| 'stretch' \| 'original'` | `'contain'` | 缩放方式 |
+| `hardwareDecoding` | `boolean` | `true` | 是否启用硬件解码。出现花屏 / 颜色错乱 / 解码失败时改成 `false` 走纯软解。 |
 | `initOptions` | `string[]` | `[]` | libvlc 实例选项，如 `['--rtsp-tcp']` |
 | `mediaOptions` | `string[]` | `[]` | libvlc media 选项，如 `[':network-caching=200']` |
 
@@ -148,7 +149,7 @@ interface VlcPlayerHandle {
 
 ```tsx
 <VlcPlayerView
-  url="rtsp://camera.public.ip/live"
+  source="rtsp://camera.public.ip/live"
   initOptions={['--rtsp-tcp']}
 />
 ```
@@ -157,7 +158,7 @@ interface VlcPlayerHandle {
 
 ```tsx
 <VlcPlayerView
-  url={url}
+  source={url}
   mediaOptions={[':network-caching=20', ':clock-jitter=0']}
 />
 ```
@@ -166,27 +167,60 @@ interface VlcPlayerHandle {
 
 ```tsx
 <VlcPlayerView
-  url={url}
+  source={url}
   mediaOptions={[':network-caching=3000']}
 />
 ```
 
-### 花屏 / 颜色错乱
+### 花屏 / 颜色错乱 / 解码失败
 
 硬件解码器对某些视频不兼容，关掉走软解：
 
 ```tsx
 <VlcPlayerView
-  url={url}
-  mediaOptions={[':no-hw-dec']}
+  source={url}
+  hardwareDecoding={false}
 />
 ```
+
+修改 `hardwareDecoding` 会重新加载媒体。底层实现：
+
+- iOS（VLCKit 4）注入 `:codec=avcodec,all`，让 libvlc 优先用 FFmpeg 软解器
+  而不是 VideoToolbox——和 VLC for iOS 设置页 → Hardware decoding → Off
+  完全一致。
+- Android（libvlc-android 3.x）调用 `Media.setHWDecoderEnabled(false,
+  false)`——和 VLC for Android 设置页 → Hardware acceleration → Disabled
+  完全一致。
+
+不要同时在 `mediaOptions` 里手动塞 `:codec=...` 或 `:no-hw-dec`——两个平台
+底层的选项字符串不一样，你的覆盖会被本 prop 后写的值盖掉。
 
 ### 只要音频不要视频（或反之）
 
 ```tsx
-<VlcPlayerView url={url} mediaOptions={[':no-video']} />
-<VlcPlayerView url={url} mediaOptions={[':no-audio']} />
+<VlcPlayerView source={url} mediaOptions={[':no-video']} />
+<VlcPlayerView source={url} mediaOptions={[':no-audio']} />
+```
+
+### 流被 Referer 防盗链拦截（403 / 404）
+
+很多 CDN / 视频网站会校验 `Referer` 头是否在白名单里，不匹配就拒绝。
+通过 source 对象传 `Referer`：
+
+```tsx
+<VlcPlayerView
+  source={{
+    uri: 'https://cdn.example.com/anti-hotlink.m3u8',
+    referer: 'https://www.example.com/',
+    userAgent: 'Mozilla/5.0',  // 可选
+  }}
+/>
+```
+
+> **libvlc 仅支持 `Referer` 和 `User-Agent` 两个 HTTP 头**——任意自定义
+> header（如 `Authorization: Bearer ...`、`X-Custom-*`）注入不进去，
+> 这是 libvlc 网络栈本身的限制。要传 Bearer token 鉴权，请把 token
+> 放进 URL 查询参数或用 HTTP Basic Auth（`https://user:pass@host/...`）。
 ```
 
 > `initOptions` 前缀用 `--`，`mediaOptions` 前缀用 `:`。完整选项列表见 [VLC 官方文档](https://wiki.videolan.org/VLC_command-line_help/)。

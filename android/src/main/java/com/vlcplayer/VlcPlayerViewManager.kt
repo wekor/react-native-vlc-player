@@ -59,6 +59,18 @@ class VlcPlayerViewManager :
     view.setResizeMode(value)
   }
 
+  override fun setHardwareDecoding(view: VlcPlayerView, value: Boolean) {
+    view.setHardwareDecoding(value)
+  }
+
+  override fun setReferer(view: VlcPlayerView, value: String?) {
+    view.setReferer(value)
+  }
+
+  override fun setUserAgent(view: VlcPlayerView, value: String?) {
+    view.setUserAgent(value)
+  }
+
   override fun setInitOptions(view: VlcPlayerView, value: ReadableArray?) {
     view.setInitOptions(value.toStringList())
   }

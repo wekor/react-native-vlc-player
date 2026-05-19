@@ -51,12 +51,17 @@ type SnapshotResultEvent = Readonly<{
 // ---- Native props ----
 
 interface NativeProps extends ViewProps {
+  // Flat wire fields. JS wrapper normalizes the public `source` prop
+  // (`string | { uri, referer?, userAgent? }`) into these three.
   url?: string;
+  referer?: string;
+  userAgent?: string;
   paused?: CodegenTypes.WithDefault<boolean, false>;
   muted?: CodegenTypes.WithDefault<boolean, false>;
   volume?: CodegenTypes.WithDefault<CodegenTypes.Float, 1.0>;
   repeat?: CodegenTypes.WithDefault<boolean, false>;
   resizeMode?: CodegenTypes.WithDefault<string, 'contain'>;
+  hardwareDecoding?: CodegenTypes.WithDefault<boolean, true>;
   initOptions?: ReadonlyArray<string>;
   mediaOptions?: ReadonlyArray<string>;
 

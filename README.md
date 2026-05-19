@@ -8,7 +8,7 @@ A fully-featured video player for iOS + Android. **One line and it plays.**
 import { VlcPlayerView } from '@wekor/react-native-vlc-player';
 
 <VlcPlayerView
-  url="rtsp://192.168.1.10/live"
+  source="rtsp://192.168.1.10/live"
   style={{ flex: 1 }}
 />
 ```
@@ -33,7 +33,7 @@ Requires React Native 0.74+ with the New Architecture enabled.
 ### Minimal
 
 ```tsx
-<VlcPlayerView url={url} style={{ flex: 1 }} />
+<VlcPlayerView source={url} style={{ flex: 1 }} />
 ```
 
 ### Playback control
@@ -42,7 +42,7 @@ Requires React Native 0.74+ with the New Architecture enabled.
 const [paused, setPaused] = useState(false);
 
 <VlcPlayerView
-  url={url}
+  source={url}
   paused={paused}
   muted={isMuted}
   volume={0.8}
@@ -56,7 +56,7 @@ const [loading, setLoading] = useState(true);
 
 <View>
   <VlcPlayerView
-    url={url}
+    source={url}
     onBuffer={({ isBuffering }) => setLoading(isBuffering)}
   />
   {loading && <ActivityIndicator style={StyleSheet.absoluteFill} />}
@@ -71,7 +71,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 
 <VlcPlayerView
   ref={ref}
-  url={url}
+  source={url}
   onProgress={setProgress}
 />
 <Slider
@@ -86,7 +86,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 ```tsx
 const ref = useRef<VlcPlayerHandle>(null);
 
-<VlcPlayerView ref={ref} url={url} />
+<VlcPlayerView ref={ref} source={url} />
 <Button onPress={async () => {
   const base64Png = await ref.current?.snapshot();
   // save / upload / display
@@ -99,13 +99,14 @@ const ref = useRef<VlcPlayerHandle>(null);
 
 | Prop | Type | Default | Description |
 |---|---|---|---|
-| `url` | `string` | — | Video source (required) |
+| `source` | `string \| { uri: string; referer?: string; userAgent?: string }` | — | Video source (required). String form is shorthand for `{ uri: ... }`. Object form supports `Referer` / `User-Agent` headers (the only HTTP headers libvlc can inject). |
 | `style` | `ViewStyle` | — | Standard RN style |
 | `paused` | `boolean` | `false` | Pause playback |
 | `muted` | `boolean` | `false` | Mute audio |
 | `volume` | `number` | `1` | Volume, 0..1 |
 | `repeat` | `boolean` | `false` | Loop playback |
 | `resizeMode` | `'contain' \| 'cover' \| 'stretch' \| 'original'` | `'contain'` | Scaling mode |
+| `hardwareDecoding` | `boolean` | `true` | Toggle hardware video decoding. Set `false` to force software decoding when the HW decoder produces artifacts. |
 | `initOptions` | `string[]` | `[]` | libvlc instance options, e.g. `['--rtsp-tcp']` |
 | `mediaOptions` | `string[]` | `[]` | libvlc media options, e.g. `[':network-caching=200']` |
 
@@ -148,7 +149,7 @@ Usually NAT blocking UDP. Switch to TCP:
 
 ```tsx
 <VlcPlayerView
-  url="rtsp://camera.public.ip/live"
+  source="rtsp://camera.public.ip/live"
   initOptions={['--rtsp-tcp']}
 />
 ```
@@ -157,7 +158,7 @@ Usually NAT blocking UDP. Switch to TCP:
 
 ```tsx
 <VlcPlayerView
-  url={url}
+  source={url}
   mediaOptions={[':network-caching=20', ':clock-jitter=0']}
 />
 ```
@@ -166,28 +167,62 @@ Usually NAT blocking UDP. Switch to TCP:
 
 ```tsx
 <VlcPlayerView
-  url={url}
+  source={url}
   mediaOptions={[':network-caching=3000']}
 />
 ```
 
-### Artifacts / wrong colors
+### Artifacts / wrong colors / decode failures
 
 The hardware decoder may not support the stream. Force software decoding:
 
 ```tsx
 <VlcPlayerView
-  url={url}
-  mediaOptions={[':no-hw-dec']}
+  source={url}
+  hardwareDecoding={false}
 />
 ```
+
+Changing `hardwareDecoding` reloads the media. Under the hood:
+
+- iOS (VLCKit 4) adds `:codec=avcodec,all` so libvlc tries the FFmpeg software
+  decoder before VideoToolbox. Same path as VLC for iOS's Settings → Hardware
+  decoding → Off.
+- Android (libvlc-android 3.x) calls `Media.setHWDecoderEnabled(false, false)`,
+  which is what VLC for Android's Settings → Hardware acceleration →
+  Disabled does.
+
+Do not also pass `:codec=...` or `:no-hw-dec` in `mediaOptions` — the two
+platforms use different underlying option strings and your override will be
+clobbered.
 
 ### Audio only (or video only)
 
 ```tsx
-<VlcPlayerView url={url} mediaOptions={[':no-video']} />
-<VlcPlayerView url={url} mediaOptions={[':no-audio']} />
+<VlcPlayerView source={url} mediaOptions={[':no-video']} />
+<VlcPlayerView source={url} mediaOptions={[':no-audio']} />
 ```
+
+### Stream is blocked by Referer anti-hotlink check (403 / 404)
+
+Some CDNs and video hosts reject requests where the `Referer` header doesn't
+match an allowlisted domain. Pass `Referer` via the source object:
+
+```tsx
+<VlcPlayerView
+  source={{
+    uri: 'https://cdn.example.com/anti-hotlink.m3u8',
+    referer: 'https://www.example.com/',
+    userAgent: 'Mozilla/5.0',  // optional
+  }}
+/>
+```
+
+> **libvlc only supports `Referer` and `User-Agent`** — arbitrary HTTP
+> headers (e.g. `Authorization: Bearer ...`, `X-Custom-*`) cannot be
+> injected because libvlc's HTTP access module doesn't expose them. If
+> your stream needs bearer-token auth, put the token in the URL query
+> string or use HTTP Basic Auth (`https://user:pass@host/...`).
 
 > `initOptions` use the `--` prefix; `mediaOptions` use the `:` prefix. See the [VLC command-line reference](https://wiki.videolan.org/VLC_command-line_help/) for the full list.
 >

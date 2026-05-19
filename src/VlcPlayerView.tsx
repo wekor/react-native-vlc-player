@@ -2,11 +2,13 @@ import * as React from 'react';
 
 import NativeVlcPlayerView, { Commands } from './VlcPlayerViewNativeComponent';
 import type {
+  VideoSource,
   VlcPlayerHandle,
   VlcPlayerViewProps,
 } from './VlcPlayerView.types';
 
 export type {
+  VideoSource,
   VlcPlayerBufferPayload,
   VlcPlayerErrorPayload,
   VlcPlayerHandle,
@@ -51,15 +53,22 @@ export const VlcPlayerView = React.forwardRef<
     onLoad,
     onPlaying,
     onEnd,
+    source,
     paused = false,
     muted = false,
     volume = 1,
     repeat = false,
     resizeMode = 'contain',
+    hardwareDecoding = true,
     initOptions,
     mediaOptions,
     ...rest
   } = props;
+
+  // Normalize the public `source` (string | { uri, referer, userAgent })
+  // into the flat fields the codegen component accepts. String form gets
+  // unwrapped to `{ uri }`; object form passes through.
+  const { url, referer, userAgent } = normalizeSource(source);
 
   const nativeRef =
     React.useRef<React.ComponentRef<typeof NativeVlcPlayerView>>(null);
@@ -163,11 +172,15 @@ export const VlcPlayerView = React.forwardRef<
   return (
     <NativeVlcPlayerView
       ref={nativeRef}
+      url={url}
+      referer={referer}
+      userAgent={userAgent}
       paused={paused}
       muted={muted}
       volume={volume}
       repeat={repeat}
       resizeMode={resizeMode}
+      hardwareDecoding={hardwareDecoding}
       initOptions={initOptions}
       mediaOptions={mediaOptions}
       onLoad={handleLoad}
@@ -178,3 +191,21 @@ export const VlcPlayerView = React.forwardRef<
     />
   );
 });
+
+function normalizeSource(source: VideoSource | undefined): {
+  url: string | undefined;
+  referer: string | undefined;
+  userAgent: string | undefined;
+} {
+  if (source == null) {
+    return { url: undefined, referer: undefined, userAgent: undefined };
+  }
+  if (typeof source === 'string') {
+    return { url: source, referer: undefined, userAgent: undefined };
+  }
+  return {
+    url: source.uri,
+    referer: source.referer,
+    userAgent: source.userAgent,
+  };
+}

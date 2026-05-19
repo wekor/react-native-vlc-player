@@ -3,6 +3,36 @@ import type { ViewProps } from 'react-native';
 /** 视频缩放方式 */
 export type VlcPlayerResizeMode = 'contain' | 'cover' | 'stretch' | 'original';
 
+/**
+ * 视频源 / Video source.
+ *
+ * 字符串形式等价于 `{ uri: ... }`。对象形式允许额外配置 HTTP 请求头——
+ * 注意 libvlc **只支持 `Referer` 和 `User-Agent` 两个头**，其他自定义
+ * header（如 `Authorization`）受 libvlc 网络栈限制无法注入；如需 Bearer
+ * token 鉴权，请把 token 放进 URL 查询参数或用 HTTP Basic Auth。
+ *
+ * String form is equivalent to `{ uri: ... }`. Object form allows extra
+ * HTTP request configuration — but libvlc **only supports `Referer` and
+ * `User-Agent` headers**, arbitrary headers (e.g. `Authorization`) cannot
+ * be injected due to libvlc network stack constraints.
+ */
+export type VideoSource =
+  | string
+  | {
+      /** 视频/流地址。RTSP / RTMP / HTTP(S) / HLS / file:// 都支持。 */
+      uri: string;
+      /**
+       * HTTP `Referer` 头。常用于绕开防盗链（B 站、CDN 防盗链等都查 Referer）。
+       * 仅对 HTTP/HTTPS 流有效。
+       */
+      referer?: string;
+      /**
+       * HTTP `User-Agent` 头。某些服务器对默认 libvlc UA 有限制时使用。
+       * 仅对 HTTP/HTTPS 流有效。
+       */
+      userAgent?: string;
+    };
+
 /** `onLoad` 事件 payload —— 元数据解析完成 */
 export type VlcPlayerLoadPayload = {
   /** 视频总时长，毫秒。直播流为 0。 */
@@ -35,8 +65,15 @@ export type VlcPlayerErrorPayload = {
 };
 
 export type VlcPlayerViewProps = ViewProps & {
-  /** 视频/流地址。RTSP / RTMP / HTTP(S) / HLS / file:// 都支持。 */
-  url?: string;
+  /**
+   * 视频源。字符串或对象形式（对象支持 `referer` / `userAgent`）。
+   *
+   * @example
+   * source="https://example.com/stream.m3u8"
+   * @example
+   * source={{ uri: 'https://example.com/stream.m3u8', referer: 'https://example.com/' }}
+   */
+  source?: VideoSource;
 
   /** 暂停。受控属性。@default false */
   paused?: boolean;
@@ -51,6 +88,21 @@ export type VlcPlayerViewProps = ViewProps & {
   resizeMode?: VlcPlayerResizeMode;
 
   /**
+   * 是否启用硬件解码。出现花屏 / 颜色错乱 / 解码失败时改成 `false` 强制纯软解
+   * 排查。修改此值会重新加载媒体，不能在播放中无缝切换。
+   *
+   * - iOS 走 VLCKit 4 / VideoToolbox；关闭硬解通过 `:codec=avcodec,all`
+   *   实现（与 VLC-iOS 官方应用一致）。
+   * - Android 走 libvlc-android 的 `setHWDecoderEnabled` 接口。
+   *
+   * 控制硬解请使用此 prop，不要直接在 `mediaOptions` 里塞 `:codec=...`
+   * 或 `:no-hw-dec` —— 两个平台底层接口不同，混用会被覆盖。
+   *
+   * @default true
+   */
+  hardwareDecoding?: boolean;
+
+  /**
    * libvlc 实例级别选项（`--` 前缀，传给 LibVLC 构造函数）。
    * 用于配置音频输出模块、verbose 日志等 libvlc 全局设置。
    * 例：`['--rtsp-tcp']`
@@ -62,7 +114,9 @@ export type VlcPlayerViewProps = ViewProps & {
   /**
    * libvlc media 级别选项（`:` 前缀，传给 Media.addOption）。
    * 用于配置当前媒体的 caching / 网络 / 解码等行为。
-   * 例：`[':network-caching=200', ':no-hw-dec']`
+   * 例：`[':network-caching=200']`
+   *
+   * 控制硬解请使用 `hardwareDecoding` prop。
    */
   mediaOptions?: readonly string[];
 

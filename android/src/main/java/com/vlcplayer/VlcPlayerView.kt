@@ -48,6 +48,9 @@ class VlcPlayerView @JvmOverloads constructor(
   private var desiredMuted: Boolean = false
   private var desiredVolume: Float = 1f
   private var desiredRepeat: Boolean = false
+  private var desiredHardwareEnabled: Boolean = true
+  private var desiredReferer: String? = null
+  private var desiredUserAgent: String? = null
 
   // Internal state
   private var playerSession: PlayerSession? = null
@@ -141,6 +144,28 @@ class VlcPlayerView @JvmOverloads constructor(
   fun setRepeatMode(repeat: Boolean) {
     if (released) return
     desiredRepeat = repeat
+  }
+
+  fun setHardwareDecoding(enabled: Boolean) {
+    if (released || enabled == desiredHardwareEnabled) return
+    desiredHardwareEnabled = enabled
+    if (currentUri != null) pendingApply = true
+  }
+
+  fun setReferer(value: String?) {
+    if (released) return
+    val resolved = value?.trim()?.takeIf { it.isNotEmpty() }
+    if (resolved == desiredReferer) return
+    desiredReferer = resolved
+    if (currentUri != null) pendingApply = true
+  }
+
+  fun setUserAgent(value: String?) {
+    if (released) return
+    val resolved = value?.trim()?.takeIf { it.isNotEmpty() }
+    if (resolved == desiredUserAgent) return
+    desiredUserAgent = resolved
+    if (currentUri != null) pendingApply = true
   }
 
   fun setResizeMode(mode: String?) {
@@ -537,14 +562,32 @@ class VlcPlayerView @JvmOverloads constructor(
       mediaPlayer.media?.release()
 
       val media = Media(libVlc, uri)
-      // User options must be added BEFORE setHWDecoderEnabled — the latter
-      // auto-injects `:network-caching=1500` / `:file-caching=1500` unless
-      // the flag is already set, which would shadow user-provided values.
+      // User options must be added BEFORE the HW decoder configuration —
+      // setDefaultMediaPlayerOptions / setHWDecoderEnabled auto-inject
+      // `:network-caching=1500` / `:file-caching=1500` unless the flag is
+      // already set, which would shadow user-provided values.
       mediaOptions.forEach(media::addOption)
       // Safety net only: handleEndReached() actually drives repeat because
       // libvlc 3.x's seamless input-repeat is unreliable.
       if (desiredRepeat) media.addOption(":input-repeat=65535")
-      media.setHWDecoderEnabled(true, false)
+      if (desiredHardwareEnabled) {
+        // setDefaultMediaPlayerOptions respects user-set `:codec=` (via
+        // libvlcjni's internal mCodecOptionSet flag), so user mediaOptions
+        // aren't clobbered. Internally this is `setHWDecoderEnabled(true,
+        // false)` plus a few caching defaults.
+        media.setDefaultMediaPlayerOptions()
+      } else {
+        // libvlcjni 3.x maps this to `addOption(":codec=all")`, which on
+        // Android lets default capability priority pick avcodec (software)
+        // instead of mediacodec.
+        media.setHWDecoderEnabled(false, false)
+      }
+      // HTTP Referer / User-Agent. libvlc only supports these two HTTP
+      // headers at the access-module level — arbitrary headers (e.g.
+      // Authorization) cannot be injected. Applied after user mediaOptions
+      // so the source-object form wins over a manual `mediaOptions` override.
+      desiredReferer?.let { media.addOption(":http-referrer=$it") }
+      desiredUserAgent?.let { media.addOption(":http-user-agent=$it") }
 
       mediaPlayer.media = media
       media.release()

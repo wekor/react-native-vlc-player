@@ -21,6 +21,11 @@ import {
 // ---------------------------------------------------------------------------
 const SOURCES: { name: string; url: string; note: string }[] = [
   {
+    name: 'RTSP (本机摄像头)',
+    url: 'rtsp://192.168.3.179:50001/live/0',
+    note: '直播源,videoSize 可能从未被报告',
+  },
+  {
     name: 'MP4 / HTTPS',
     url: 'https://www.w3schools.com/Html/mov_bbb.mp4',
     note: 'VOD 标准用例，应能拿到 duration，onProgress 持续触发',
@@ -39,11 +44,6 @@ const SOURCES: { name: string; url: string; note: string }[] = [
     name: 'DASH mpd',
     url: 'https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd',
     note: 'Akamai DASH 测试源',
-  },
-  {
-    name: 'RTSP (本机摄像头)',
-    url: 'rtsp://172.27.1.38:50001/live/0',
-    note: '直播源,videoSize 可能从未被报告',
   },
   {
     name: '坏 URL',
@@ -143,7 +143,7 @@ export default function App() {
         <VlcPlayerView
           ref={ref}
           style={styles.player}
-          url={source.url}
+          source={source.url}
           paused={paused}
           resizeMode={resizeMode}
           mediaOptions={[':rtsp-tcp', ':network-caching=200']}

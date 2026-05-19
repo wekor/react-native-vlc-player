@@ -130,6 +130,14 @@ static NSString *VLCExceptionReason(NSException *exception)
   return exception.reason ?: @"Unknown VLCKit exception";
 }
 
+// nil-aware string equality. Two nils are equal; nil and non-nil are not.
+static BOOL VLCEqualStrings(NSString *a, NSString *b)
+{
+  if (a == b) return YES;
+  if (a == nil || b == nil) return NO;
+  return [a isEqualToString:b];
+}
+
 // Masks user:password@ in URLs so credentials don't end up in logs.
 static NSString *VLCRedactedURLString(NSURL *url)
 {
@@ -265,10 +273,16 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   NSArray<NSString *> *_desiredInitOptions;
   NSArray<NSString *> *_desiredMediaOptions;
   VlcPlayerResizeMode _desiredResizeMode;
+  BOOL _desiredHardwareEnabled;
+  NSString *_desiredReferer;     // nil / empty → don't inject :http-referrer=
+  NSString *_desiredUserAgent;   // nil / empty → don't inject :http-user-agent=
 
   // Loaded (in VLC)
   NSURL *_loadedURL;
   NSArray<NSString *> *_loadedMediaOptions;
+  BOOL _loadedHardwareEnabled;
+  NSString *_loadedReferer;
+  NSString *_loadedUserAgent;
 
   // Applied (pushed to player)
   BOOL _appliedPaused;
@@ -312,6 +326,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _desiredInitOptions = @[];
     _desiredMediaOptions = @[];
     _desiredResizeMode = VlcPlayerResizeModeContain;
+    _desiredHardwareEnabled = YES;
+    _loadedHardwareEnabled = YES;
+    _desiredReferer = nil;
+    _desiredUserAgent = nil;
+    _loadedReferer = nil;
+    _loadedUserAgent = nil;
     _appliedPaused = YES;
     _appliedMuted = NO;
     _appliedVolume = 1.0f;
@@ -377,6 +397,9 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _desiredInitOptions = VLCStringsFromVector(newProps.initOptions);
   _desiredMediaOptions = VLCStringsFromVector(newProps.mediaOptions);
   _desiredResizeMode = VLCResizeModeFromString(VLCStringFromStdString(newProps.resizeMode));
+  _desiredHardwareEnabled = newProps.hardwareDecoding;
+  _desiredReferer = VLCTrimmedString(VLCStringFromStdString(newProps.referer));
+  _desiredUserAgent = VLCTrimmedString(VLCStringFromStdString(newProps.userAgent));
 
   [self syncPlayer];
   [super updateProps:props oldProps:oldProps];
@@ -480,6 +503,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _desiredInitOptions = @[];
   _desiredMediaOptions = @[];
   _desiredResizeMode = VlcPlayerResizeModeContain;
+  _desiredHardwareEnabled = YES;
+  _loadedHardwareEnabled = YES;
+  _desiredReferer = nil;
+  _desiredUserAgent = nil;
+  _loadedReferer = nil;
+  _loadedUserAgent = nil;
   _appliedAspectOverride = nil;
   _appliedPaused = YES;
   _appliedMuted = NO;
@@ -524,7 +553,10 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   BOOL needsMedia =
       _loadedURL == nil ||
       ![_loadedURL isEqual:_desiredURL] ||
-      ![_loadedMediaOptions isEqualToArray:_desiredMediaOptions];
+      ![_loadedMediaOptions isEqualToArray:_desiredMediaOptions] ||
+      _loadedHardwareEnabled != _desiredHardwareEnabled ||
+      !VLCEqualStrings(_loadedReferer, _desiredReferer) ||
+      !VLCEqualStrings(_loadedUserAgent, _desiredUserAgent);
 
   if (needsMedia && ![self loadDesiredMedia]) {
     return;
@@ -631,6 +663,26 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     if (_desiredRepeat) {
       [media addOption:@":input-repeat=65535"];
     }
+    // Force software decoding by demoting hardware decoder modules: list
+    // avcodec first so libvlc picks FFmpeg software decoder, then fall back
+    // to "all" for codecs avcodec doesn't cover. Matches VLC-iOS (which ships
+    // against the same VLCKit alpha) — chosen over libvlc 4's `:no-hw-dec`
+    // core flag because the official app's path has more line-of-evidence.
+    // Applied AFTER user mediaOptions so this prop is authoritative.
+    if (!_desiredHardwareEnabled) {
+      [media addOption:@":codec=avcodec,all"];
+    }
+    // HTTP Referer / User-Agent. libvlc only supports these two HTTP headers
+    // at the access-module level (see modules/access/http/access.c — it reads
+    // only `http-referrer` and `http-user-agent`). Other headers cannot be
+    // injected. Applied after user mediaOptions so the source-object form
+    // wins over a manual `mediaOptions` override.
+    if (_desiredReferer.length > 0) {
+      [media addOption:[NSString stringWithFormat:@":http-referrer=%@", _desiredReferer]];
+    }
+    if (_desiredUserAgent.length > 0) {
+      [media addOption:[NSString stringWithFormat:@":http-user-agent=%@", _desiredUserAgent]];
+    }
     RCTLogInfo(@"VlcPlayerView: loading media %@ with mediaOptions [%@]",
                VLCRedactedURLString(url),
                [_desiredMediaOptions componentsJoinedByString:@", "]);
@@ -638,6 +690,9 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     player.media = media;
     _loadedURL = url;
     _loadedMediaOptions = [_desiredMediaOptions copy];
+    _loadedHardwareEnabled = _desiredHardwareEnabled;
+    _loadedReferer = [_desiredReferer copy];
+    _loadedUserAgent = [_desiredUserAgent copy];
     _appliedPaused = YES;
     [self applyDisplayOptions];
     [self applyAudioOptions];
