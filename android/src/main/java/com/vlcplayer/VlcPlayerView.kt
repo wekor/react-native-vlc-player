@@ -344,7 +344,9 @@ class VlcPlayerView @JvmOverloads constructor(
   private fun parseStreamUri(url: String?): Uri? {
     val normalized = url?.trim().orEmpty()
     if (normalized.isEmpty()) return null
-    val uri = runCatching { Uri.parse(normalized) }.getOrNull() ?: return null
+    // Uri.parse never throws (parsing is lazy) — invalid input surfaces as
+    // a null/empty scheme, which the check below rejects.
+    val uri = Uri.parse(normalized)
     if (uri.scheme.isNullOrEmpty()) return null
     return uri
   }

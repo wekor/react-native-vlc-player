@@ -175,7 +175,11 @@ static inline void VLCRunOnMain(dispatch_block_t block)
 static libvlc_media_player_t *VLCRawMediaPlayer(VLCMediaPlayer *player)
 {
   if (player == nil) return NULL;
-  Ivar ivar = class_getInstanceVariable([VLCMediaPlayer class], "_playerInstance");
+  static Ivar ivar;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    ivar = class_getInstanceVariable([VLCMediaPlayer class], "_playerInstance");
+  });
   if (ivar == NULL) return NULL;
   ptrdiff_t offset = ivar_getOffset(ivar);
   void *base = (__bridge void *)player;
