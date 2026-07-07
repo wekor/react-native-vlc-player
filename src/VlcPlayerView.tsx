@@ -169,8 +169,12 @@ export const VlcPlayerView = React.forwardRef<
     [snapshot]
   );
 
+  // `rest` is spread first so a stray untyped prop can never override the
+  // internal wiring (in particular onSnapshotResult, which snapshot()'s
+  // Promise registry depends on).
   return (
     <NativeVlcPlayerView
+      {...rest}
       ref={nativeRef}
       url={url}
       referer={referer}
@@ -187,7 +191,6 @@ export const VlcPlayerView = React.forwardRef<
       onPlaying={handlePlaying}
       onEnd={handleEnd}
       onSnapshotResult={handleSnapshotResult}
-      {...rest}
     />
   );
 });

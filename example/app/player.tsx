@@ -22,7 +22,7 @@ import {
 const SOURCES: { name: string; url: string; note: string }[] = [
   {
     name: 'RTSP (本机摄像头)',
-    url: 'rtsp://192.168.3.179:50001/live/0',
+    url: 'rtsp://172.27.1.52:50001/live/0',
     note: '直播源,videoSize 可能从未被报告',
   },
   {
@@ -77,6 +77,12 @@ export default function App() {
   const [bufferPct, setBufferPct] = useState(0);
   const [paused, setPaused] = useState(false);
   const [resizeMode, setResizeMode] = useState<VlcPlayerResizeMode>('contain');
+  // 重构验证用：运行时切换 media/init options 与 repeat。
+  // mediaOptions 切换预期只触发 "Loading media"（同一 LibVLC 实例重挂 media）；
+  // initOptions 切换预期触发 "Creating player session"（重建 LibVLC，负向对照）。
+  const [lowCache, setLowCache] = useState(false);
+  const [verboseInit, setVerboseInit] = useState(false);
+  const [repeat, setRepeat] = useState(false);
   const [logs, setLogs] = useState<EventLog[]>([]);
   const [snapshotData, setSnapshotData] = useState<string | null>(null);
   const [progress, setProgress] = useState<Progress>({
@@ -145,8 +151,13 @@ export default function App() {
           style={styles.player}
           source={source.url}
           paused={paused}
+          repeat={repeat}
           resizeMode={resizeMode}
-          mediaOptions={[':rtsp-tcp', ':network-caching=200']}
+          initOptions={verboseInit ? ['-vv'] : []}
+          mediaOptions={[
+            ':rtsp-tcp',
+            lowCache ? ':network-caching=300' : ':network-caching=1500',
+          ]}
           onLoad={({ nativeEvent: { duration, videoSize } }) => {
             log(
               'onLoad',
@@ -165,7 +176,6 @@ export default function App() {
             }
           }}
           onProgress={({ nativeEvent: { currentTime, duration, percent } }) => {
-            console.log('onProgress', { currentTime, duration, percent });
             setProgress({ currentTime, duration, percent });
             // 每 10% 只记录一次,避免刷屏
             const decile = Math.floor(percent / 10);
@@ -232,6 +242,47 @@ export default function App() {
             </Pressable>
           );
         })}
+      </View>
+
+      {/* ---- 重构验证：运行时切换参数 ---- */}
+      <View style={styles.row}>
+        <Pressable
+          style={[styles.button, lowCache && styles.buttonActive]}
+          onPress={() => {
+            const next = !lowCache;
+            setLowCache(next);
+            log('test', `caching→${next ? 300 : 1500} 预期:仅 Loading media`);
+          }}
+        >
+          <Text style={styles.buttonText}>
+            缓存 {lowCache ? '300' : '1500'}
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.button, verboseInit && styles.buttonActive]}
+          onPress={() => {
+            const next = !verboseInit;
+            setVerboseInit(next);
+            log(
+              'test',
+              `initOptions ${next ? '+' : '-'}vv 预期:Creating session`
+            );
+          }}
+        >
+          <Text style={styles.buttonText}>
+            init {verboseInit ? '-vv' : '默认'}
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.button, repeat && styles.buttonActive]}
+          onPress={() => {
+            const next = !repeat;
+            setRepeat(next);
+            log('test', `repeat=${next}`);
+          }}
+        >
+          <Text style={styles.buttonText}>循环 {repeat ? '开' : '关'}</Text>
+        </Pressable>
       </View>
 
       {/* ---- controls ---- */}
@@ -377,6 +428,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 6,
   },
+  buttonActive: { backgroundColor: '#1e88e5' },
   buttonText: { color: 'white', fontSize: 14 },
   snapshotWrap: {
     position: 'absolute',

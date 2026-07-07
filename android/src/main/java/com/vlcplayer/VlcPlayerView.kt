@@ -275,7 +275,7 @@ class VlcPlayerView @JvmOverloads constructor(
       playerSession = null
       return
     }
-    ensureSession().prepare(uri, autoPlay = shouldPlayWhenReady)
+    ensureSession().prepare(uri, desiredMediaOptions, autoPlay = shouldPlayWhenReady)
   }
 
   // ============================================================
@@ -334,11 +334,12 @@ class VlcPlayerView @JvmOverloads constructor(
 
   private fun ensureSession(): PlayerSession {
     val existing = playerSession
-    if (existing != null && existing.matches(desiredInitOptions, desiredMediaOptions)) {
+    if (existing != null && existing.matches(desiredInitOptions)) {
       return existing
     }
     existing?.release()
-    val fresh = PlayerSession(context, desiredInitOptions, desiredMediaOptions)
+    Log.i(TAG, "Creating player session with initOptions [${desiredInitOptions.joinToString(", ")}]")
+    val fresh = PlayerSession(context, desiredInitOptions)
     fresh.applyResizeMode(desiredResizeMode)
     fresh.applyVolume(effectiveVolumeInt())
     if (attachedToWindow) {
@@ -354,6 +355,10 @@ class VlcPlayerView @JvmOverloads constructor(
   private fun applyVolumeAndMute() {
     playerSession?.applyVolume(effectiveVolumeInt())
   }
+
+  // Masks user:password@ in URLs so credentials don't end up in logs.
+  private fun redactUri(uri: Uri): String =
+    uri.toString().replace(Regex("//[^/@]+@"), "//***@")
 
   private fun findInnerSurfaceView(): SurfaceView? =
     videoLayout.findViewById<android.view.View>(org.videolan.R.id.player_surface_frame)
@@ -435,10 +440,12 @@ class VlcPlayerView @JvmOverloads constructor(
   // PlayerSession
   // ============================================================
 
+  // Session identity is the LibVLC instance, keyed by initOptions (its
+  // constructor args). Media-level options are applied per prepare() —
+  // changing them must NOT tear down the libvlc core.
   private inner class PlayerSession(
     context: Context,
     private val initOptions: List<String>,
-    private val mediaOptions: List<String>,
   ) {
     private val libVlc = LibVLC(context.applicationContext, ArrayList(initOptions))
     private val mediaPlayer = MediaPlayer(libVlc)
@@ -447,9 +454,14 @@ class VlcPlayerView @JvmOverloads constructor(
     private var playWhenAttached = false
     private var loadedUri: Uri? = null
 
-    // Mutated on libvlc's event thread, read on the UI thread.
-    @Volatile private var isBufferingState: Boolean = false
-    @Volatile private var hasEmittedLoad: Boolean = false
+    // libvlc-android delivers MediaPlayer events on the main thread
+    // (VLCObject posts them to a main-looper Handler), so session state is
+    // main-thread-only and emits are called directly from the handlers.
+    private var isBufferingState: Boolean = false
+    private var hasEmittedLoad: Boolean = false
+    // Cached from LengthChanged so per-tick handlers skip the JNI
+    // mediaPlayer.length query on every TimeChanged.
+    private var cachedLengthMs: Long = 0
 
     private val eventListener = MediaPlayer.EventListener { event ->
       when (event.type) {
@@ -460,7 +472,7 @@ class VlcPlayerView @JvmOverloads constructor(
         MediaPlayer.Event.TimeChanged -> handleTimeChanged(event.timeChanged)
         MediaPlayer.Event.EndReached -> handleEndReached()
         MediaPlayer.Event.EncounteredError -> handleError()
-        MediaPlayer.Event.LengthChanged -> maybeEmitLoad()
+        MediaPlayer.Event.LengthChanged -> handleLengthChanged(event.lengthChanged)
         MediaPlayer.Event.Vout -> {
           if (event.voutCount > 0) maybeEmitLoad()
         }
@@ -476,21 +488,20 @@ class VlcPlayerView @JvmOverloads constructor(
     private fun handleBuffering(percent: Float) {
       if (percent < 100f) {
         isBufferingState = true
-        post { emitBuffer(isBuffering = true, percent = percent) }
+        emitBuffer(isBuffering = true, percent = percent)
       } else if (isBufferingState) {
         isBufferingState = false
-        post { emitBuffer(isBuffering = false, percent = 100f) }
+        emitBuffer(isBuffering = false, percent = 100f)
       }
     }
 
     private fun handlePlaying() {
-      val uri = loadedUri
       if (isBufferingState) {
         isBufferingState = false
-        post { emitBuffer(isBuffering = false, percent = 100f) }
+        emitBuffer(isBuffering = false, percent = 100f)
       }
       maybeEmitLoad()
-      post { emitPlaying(uri) }
+      emitPlaying(loadedUri)
     }
 
     private fun handlePaused() {}
@@ -505,56 +516,54 @@ class VlcPlayerView @JvmOverloads constructor(
     private fun handleEndReached() {
       isBufferingState = false
       val uri = loadedUri
-      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
-      post {
-        if (length > 0L) emitProgress(length, length, 100f)
-        emitEnd(uri)
-        // libvlc 3.x leaves the player terminated after EndReached — seek-to-0
-        // + play() doesn't work, only a full prepare() restarts cleanly.
-        if (desiredRepeat && uri != null && attachedToWindow && !released) {
-          ensureSession().prepare(uri, autoPlay = true)
-        }
+      if (cachedLengthMs > 0L) emitProgress(cachedLengthMs, cachedLengthMs, 100f)
+      emitEnd(uri)
+      // libvlc 3.x leaves the player terminated after EndReached — seek-to-0
+      // + play() doesn't work, only a full prepare() restarts cleanly.
+      if (desiredRepeat && uri != null && attachedToWindow && !released) {
+        ensureSession().prepare(uri, desiredMediaOptions, autoPlay = true)
       }
     }
 
     private fun handleError() {
       isBufferingState = false
-      val uri = loadedUri
-      post {
-        emitError("VLC playback error" + (uri?.let { " for $it" } ?: ""))
-      }
+      emitError("VLC playback error" + (loadedUri?.let { " for ${redactUri(it)}" } ?: ""))
     }
 
     private fun handleTimeChanged(time: Long) {
-      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
-      if (length <= 0L) return  // live stream — no meaningful progress
+      if (cachedLengthMs <= 0L) return  // live stream — no meaningful progress
       val safeTime = time.coerceAtLeast(0L)
-      val percent = (safeTime.toFloat() / length * 100f).coerceIn(0f, 100f)
-      post { emitProgress(safeTime, length, percent) }
+      val percent = (safeTime.toFloat() / cachedLengthMs * 100f).coerceIn(0f, 100f)
+      emitProgress(safeTime, cachedLengthMs, percent)
+    }
+
+    private fun handleLengthChanged(lengthMs: Long) {
+      cachedLengthMs = lengthMs.coerceAtLeast(0L)
+      maybeEmitLoad()
     }
 
     private fun maybeEmitLoad() {
       if (hasEmittedLoad) return
-      val length = runCatching { mediaPlayer.length }.getOrDefault(0L)
       val track = runCatching { mediaPlayer.currentVideoTrack }.getOrNull()
       val w = track?.width ?: 0
       val h = track?.height ?: 0
       // Need duration (VOD) or dimensions (live) — otherwise payload is empty.
-      if (length <= 0L && (w == 0 || h == 0)) return
+      if (cachedLengthMs <= 0L && (w == 0 || h == 0)) return
       hasEmittedLoad = true
-      post { emitLoad(length, w, h) }
+      emitLoad(cachedLengthMs, w, h)
     }
 
     // ---- Public API ----
 
-    fun matches(init: List<String>, media: List<String>): Boolean =
-      initOptions == init && mediaOptions == media
+    fun matches(init: List<String>): Boolean = initOptions == init
 
-    fun prepare(uri: Uri, autoPlay: Boolean) {
+    fun prepare(uri: Uri, mediaOptions: List<String>, autoPlay: Boolean) {
+      Log.i(TAG, "Loading media ${redactUri(uri)} with mediaOptions [${mediaOptions.joinToString(", ")}]")
       loadedUri = uri
       playWhenAttached = autoPlay
       hasEmittedLoad = false
       isBufferingState = false
+      cachedLengthMs = 0
 
       runCatching {
         if (mediaPlayer.isPlaying) mediaPlayer.stop()
@@ -618,6 +627,7 @@ class VlcPlayerView @JvmOverloads constructor(
       playWhenAttached = false
       hasEmittedLoad = false
       isBufferingState = false
+      cachedLengthMs = 0
       runCatching { mediaPlayer.stop() }
       mediaPlayer.media?.release()
       mediaPlayer.media = null
