@@ -20,7 +20,7 @@ export type {
 
 // Snapshot uses a JS-side callId↔Promise registry. Each call gets a unique
 // id, the command goes to native with that id, and the native side replies
-// via `onSnapshotResult { callId, base64, error }`. We resolve the matching
+// via `onSnapshotResult { callId, path, error }`. We resolve the matching
 // promise. Module-level counter is safe because callIds only need to be
 // unique within a single view, and each view dispatches results only to
 // its own subscriber.
@@ -37,11 +37,11 @@ type CodegenLoadEvent = {
 type CodegenPlayingEvent = { nativeEvent: { url: string } };
 type CodegenEndEvent = { nativeEvent: { url: string } };
 type CodegenSnapshotEvent = {
-  nativeEvent: { callId: number; base64: string; error: string };
+  nativeEvent: { callId: number; path: string; error: string };
 };
 
 type SnapshotPending = {
-  resolve: (base64: string) => void;
+  resolve: (path: string) => void;
   reject: (error: Error) => void;
 };
 
@@ -121,12 +121,12 @@ export const VlcPlayerView = React.forwardRef<
 
   const handleSnapshotResult = React.useCallback(
     (event: CodegenSnapshotEvent) => {
-      const { callId, base64, error } = event.nativeEvent;
+      const { callId, path, error } = event.nativeEvent;
       const pending = pendingSnapshots.get(callId);
       if (!pending) return;
       pendingSnapshots.delete(callId);
       if (error) pending.reject(new Error(error));
-      else pending.resolve(base64);
+      else pending.resolve(path);
     },
     [pendingSnapshots]
   );

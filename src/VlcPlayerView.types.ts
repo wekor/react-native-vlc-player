@@ -148,7 +148,11 @@ export type VlcPlayerHandle = {
   pause: () => void;
   /** 跳转到指定秒（仅点播）。 */
   seek: (seconds: number) => void;
-  /** 截图，返回 base64 编码的 PNG。 */
+  /**
+   * 截取当前画面，返回 PNG 文件的 `file://` URI，可直接用于
+   * `<Image source={{ uri }}>`。文件写在应用缓存目录，系统可能随时
+   * 清理；需要长期保存请自行拷贝。
+   */
   snapshot: () => Promise<string>;
   /** 重新拉流，断流恢复用。 */
   reload: () => void;

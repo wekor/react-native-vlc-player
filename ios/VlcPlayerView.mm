@@ -440,7 +440,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 {
   int32_t callId = (int32_t)callIdNumber;
   if (_destroyed || _mediaPlayer == nil) {
-    [self emitSnapshotResult:callId base64:nil error:@"Player not ready"];
+    [self emitSnapshotResult:callId path:nil error:@"Player not ready"];
     return;
   }
   NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
@@ -450,18 +450,19 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     // libvlc_video_take_snapshot is sync; w=0 h=0 → source dimensions.
     [_mediaPlayer saveVideoSnapshotAt:path withWidth:0 andHeight:0];
   } @catch (NSException *exception) {
-    [self emitSnapshotResult:callId base64:nil error:VLCExceptionReason(exception)];
+    [self emitSnapshotResult:callId path:nil error:VLCExceptionReason(exception)];
     return;
   }
 
-  NSData *data = [NSData dataWithContentsOfFile:path];
-  [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-  if (data.length == 0) {
-    [self emitSnapshotResult:callId base64:nil error:@"Snapshot file unavailable"];
+  // The file stays in tmp for the consumer (JS gets a file:// URI); the OS
+  // reclaims tmp storage, and callers copy it out if they need persistence.
+  NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+  if (attributes.fileSize == 0) {
+    [self emitSnapshotResult:callId path:nil error:@"Snapshot file unavailable"];
     return;
   }
   [self emitSnapshotResult:callId
-                    base64:[data base64EncodedStringWithOptions:0]
+                      path:[NSURL fileURLWithPath:path].absoluteString
                      error:nil];
 }
 
@@ -1134,13 +1135,13 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   });
 }
 
-- (void)emitSnapshotResult:(int32_t)callId base64:(NSString *)base64 error:(NSString *)error
+- (void)emitSnapshotResult:(int32_t)callId path:(NSString *)path error:(NSString *)error
 {
   auto emitter = [self eventEmitter];
   if (emitter == nullptr) return;
   emitter->onSnapshotResult({
     .callId = (int)callId,
-    .base64 = base64 == nil ? "" : std::string(base64.UTF8String),
+    .path = path == nil ? "" : std::string(path.UTF8String),
     .error = error == nil ? "" : std::string(error.UTF8String),
   });
 }

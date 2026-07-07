@@ -87,7 +87,11 @@ export default function App() {
   const [repeat, setRepeat] = useState(false);
   const [rate, setRate] = useState(1);
   const [logs, setLogs] = useState<EventLog[]>([]);
-  const [snapshotData, setSnapshotData] = useState<string | null>(null);
+  const [snapshotData, setSnapshotData] = useState<{
+    uri: string;
+    w: number;
+    h: number;
+  } | null>(null);
   const [progress, setProgress] = useState<Progress>({
     currentTime: 0,
     duration: 0,
@@ -317,10 +321,16 @@ export default function App() {
           style={styles.button}
           onPress={async () => {
             try {
-              const b64 = await ref.current?.snapshot();
-              if (b64) {
-                setSnapshotData(`data:image/png;base64,${b64}`);
-                log('snapshot', `ok ${(b64.length / 1024).toFixed(0)}KB`);
+              const uri = await ref.current?.snapshot();
+              if (uri) {
+                Image.getSize(
+                  uri,
+                  (w, h) => {
+                    setSnapshotData({ uri, w, h });
+                    log('snapshot', `${w}x${h} ${uri.split('/').pop()}`);
+                  },
+                  (e) => log('snapshot', `getSize err ${e}`)
+                );
               }
             } catch (e: any) {
               log('snapshot', `err ${e?.message ?? e}`);
@@ -330,17 +340,6 @@ export default function App() {
           <Text style={styles.buttonText}>截图</Text>
         </Pressable>
       </View>
-
-      {/* ---- snapshot preview ---- */}
-      {snapshotData && (
-        <Pressable
-          style={styles.snapshotWrap}
-          onPress={() => setSnapshotData(null)}
-        >
-          <Image source={{ uri: snapshotData }} style={styles.snapshotImg} />
-          <Text style={styles.snapshotHint}>点击关闭</Text>
-        </Pressable>
-      )}
 
       {/* ---- event log ---- */}
       <ScrollView style={styles.logBox}>
@@ -352,6 +351,27 @@ export default function App() {
           </Text>
         ))}
       </ScrollView>
+
+      {/* ---- snapshot preview ----
+           不透明背景 + 盒子贴合图片实际宽高比：预览里看到的每个像素
+           都来自 PNG 本身，不会再有遮罩留白造成的"黑色色块"错觉。 */}
+      {snapshotData && (
+        <Pressable
+          style={styles.snapshotWrap}
+          onPress={() => setSnapshotData(null)}
+        >
+          <Image
+            source={{ uri: snapshotData.uri }}
+            style={[
+              styles.snapshotImg,
+              { aspectRatio: snapshotData.w / snapshotData.h },
+            ]}
+          />
+          <Text style={styles.snapshotHint}>
+            {snapshotData.w}×{snapshotData.h} 点击关闭
+          </Text>
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -446,20 +466,20 @@ const styles = StyleSheet.create({
   buttonText: { color: 'white', fontSize: 14 },
   snapshotWrap: {
     position: 'absolute',
-    top: 100,
-    left: 12,
-    right: 12,
-    bottom: 100,
-    backgroundColor: 'rgba(0,0,0,0.9)',
-    borderRadius: 8,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#000',
     padding: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
   snapshotImg: {
-    flex: 1,
     width: '100%',
     resizeMode: 'contain',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#555',
   },
   snapshotHint: { color: '#aaa', marginTop: 8, fontSize: 12 },
   logBox: {

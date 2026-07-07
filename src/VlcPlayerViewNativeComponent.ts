@@ -44,7 +44,7 @@ type ErrorEvent = Readonly<{
 // exposes this event to library users.
 type SnapshotResultEvent = Readonly<{
   callId: CodegenTypes.Int32;
-  base64: string;
+  path: string;
   error: string;
 }>;
 

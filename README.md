@@ -89,8 +89,9 @@ const ref = useRef<VlcPlayerHandle>(null);
 
 <VlcPlayerView ref={ref} source={url} />
 <Button onPress={async () => {
-  const base64Png = await ref.current?.snapshot();
-  // save / upload / display
+  const uri = await ref.current?.snapshot(); // file:// URI of a PNG
+  // display directly: <Image source={{ uri }} />
+  // The file lives in the app cache dir — copy it out for persistence.
 }} />
 ```
 
@@ -134,7 +135,7 @@ interface VlcPlayerHandle {
   play(): void;
   pause(): void;
   seek(seconds: number): void;        // Seek to second (VOD)
-  snapshot(): Promise<string>;        // Snapshot, returns base64 PNG
+  snapshot(): Promise<string>;        // Snapshot, resolves to a file:// PNG URI
   reload(): void;                     // Reconnect the stream
 }
 ```

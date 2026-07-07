@@ -6,7 +6,6 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
-import android.util.Base64
 import android.util.Log
 import android.view.PixelCopy
 import android.view.SurfaceView
@@ -19,7 +18,9 @@ import com.facebook.react.bridge.ReactContext
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.UIManagerHelper
 import com.facebook.react.uimanager.events.Event
-import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 import java.util.concurrent.Executors
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
@@ -220,12 +221,12 @@ class VlcPlayerView @JvmOverloads constructor(
 
   fun cmdSnapshot(callId: Int) {
     if (released) {
-      emitSnapshotResult(callId, base64 = null, error = "View released")
+      emitSnapshotResult(callId, path = null, error = "View released")
       return
     }
     val surfaceView = findInnerSurfaceView()
     if (surfaceView == null || surfaceView.width == 0 || surfaceView.height == 0) {
-      emitSnapshotResult(callId, base64 = null, error = "Video surface not ready")
+      emitSnapshotResult(callId, path = null, error = "Video surface not ready")
       return
     }
     // SurfaceView pixels live on a Surface owned by SurfaceFlinger; PixelCopy
@@ -236,23 +237,30 @@ class VlcPlayerView @JvmOverloads constructor(
         encodeSnapshotAsync(callId, frame)
       } else {
         frame.recycle()
-        emitSnapshotResult(callId, base64 = null, error = "PixelCopy failed: $result")
+        emitSnapshotResult(callId, path = null, error = "PixelCopy failed: $result")
       }
     }, mainHandler)
   }
 
   private fun encodeSnapshotAsync(callId: Int, frame: Bitmap) {
     snapshotExecutor.execute {
+      // The file stays in cacheDir for the consumer (JS gets a file:// URI);
+      // the OS reclaims cache storage, and callers copy it out if they need
+      // persistence.
       val result = runCatching {
-        val bos = ByteArrayOutputStream(frame.width * frame.height / 2)
-        frame.compress(Bitmap.CompressFormat.PNG, 100, bos)
-        Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+        val file = File(context.cacheDir, "vlc-snap-$callId-${UUID.randomUUID()}.png")
+        val ok = FileOutputStream(file).use { frame.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        if (!ok) {
+          file.delete()
+          error("PNG encoding failed")
+        }
+        Uri.fromFile(file).toString()
       }
       frame.recycle()
       post {
         result.fold(
-          onSuccess = { emitSnapshotResult(callId, base64 = it, error = null) },
-          onFailure = { emitSnapshotResult(callId, base64 = null, error = it.message ?: "Snapshot encoding failed") },
+          onSuccess = { emitSnapshotResult(callId, path = it, error = null) },
+          onFailure = { emitSnapshotResult(callId, path = null, error = it.message ?: "Snapshot encoding failed") },
         )
       }
     }
@@ -420,10 +428,10 @@ class VlcPlayerView @JvmOverloads constructor(
     emitEvent("topError", map)
   }
 
-  private fun emitSnapshotResult(callId: Int, base64: String?, error: String?) {
+  private fun emitSnapshotResult(callId: Int, path: String?, error: String?) {
     val map = Arguments.createMap().apply {
       putInt("callId", callId)
-      putString("base64", base64 ?: "")
+      putString("path", path ?: "")
       putString("error", error ?: "")
     }
     emitEvent("topSnapshotResult", map)
