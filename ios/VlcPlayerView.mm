@@ -269,6 +269,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   BOOL _desiredPaused;
   BOOL _desiredMuted;
   float _desiredVolume;
+  float _desiredRate;
   BOOL _desiredRepeat;
   NSArray<NSString *> *_desiredInitOptions;
   NSArray<NSString *> *_desiredMediaOptions;
@@ -288,6 +289,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   BOOL _appliedPaused;
   BOOL _appliedMuted;
   float _appliedVolume;
+  float _appliedRate;
   NSString *_appliedAspectOverride;
 
   BOOL _destroyed;
@@ -332,9 +334,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _desiredUserAgent = nil;
     _loadedReferer = nil;
     _loadedUserAgent = nil;
+    _desiredRate = 1.0f;
     _appliedPaused = YES;
     _appliedMuted = NO;
     _appliedVolume = 1.0f;
+    _appliedRate = 1.0f;
 
     [self setupView];
     [self registerLifecycleObservers];
@@ -393,6 +397,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     if (vol > 1.0f) vol = 1.0f;
     _desiredVolume = vol;
   }
+  _desiredRate = newProps.rate > 0.0f ? newProps.rate : 1.0f;
   _desiredRepeat = newProps.repeat;
   _desiredInitOptions = VLCStringsFromVector(newProps.initOptions);
   _desiredMediaOptions = VLCStringsFromVector(newProps.mediaOptions);
@@ -509,10 +514,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _desiredUserAgent = nil;
   _loadedReferer = nil;
   _loadedUserAgent = nil;
+  _desiredRate = 1.0f;
   _appliedAspectOverride = nil;
   _appliedPaused = YES;
   _appliedMuted = NO;
   _appliedVolume = 1.0f;
+  _appliedRate = 1.0f;
   _backgroundDate = nil;
   _hasEmittedLoad = NO;
   _hasEmittedEnd = NO;
@@ -536,6 +543,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   [self applyDisplayOptions];
   [self applyAudioOptions];
+  [self applyPlaybackRate];
 
   if (_desiredURL == nil) {
     [self releasePlayer];
@@ -610,6 +618,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _mediaPlayer = player;
     _playerInitOptions = [_desiredInitOptions copy];
     _appliedPaused = YES;
+    _appliedRate = 1.0f;
     _appliedAspectOverride = nil;
     return YES;
   } @catch (NSException *exception) {
@@ -694,8 +703,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _loadedReferer = [_desiredReferer copy];
     _loadedUserAgent = [_desiredUserAgent copy];
     _appliedPaused = YES;
+    // Force a rate re-push for the new media — don't trust libvlc to carry
+    // a non-default rate across media changes.
+    _appliedRate = 1.0f;
     [self applyDisplayOptions];
     [self applyAudioOptions];
+    [self applyPlaybackRate];
     return YES;
   } @catch (NSException *exception) {
     [self emitError:[NSString stringWithFormat:@"Failed to load VLC media: %@", VLCExceptionReason(exception)]
@@ -867,6 +880,16 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _videoOutputView.autoresizingMask = UIViewAutoresizingNone;
     _videoOutputView.frame = frame;
   }
+}
+
+// VLCKit's `rate` is a request — live streams / some protocols ignore it
+// (see VLCMediaPlayer.h). Cache to skip no-op round-trips, like volume.
+- (void)applyPlaybackRate
+{
+  if (_mediaPlayer == nil) return;
+  if (_appliedRate == _desiredRate) return;
+  _mediaPlayer.rate = _desiredRate;
+  _appliedRate = _desiredRate;
 }
 
 - (void)applyAudioOptions

@@ -47,6 +47,7 @@ class VlcPlayerView @JvmOverloads constructor(
   private var shouldPlayWhenReady: Boolean = true
   private var desiredMuted: Boolean = false
   private var desiredVolume: Float = 1f
+  private var desiredRate: Float = 1f
   private var desiredRepeat: Boolean = false
   private var desiredHardwareEnabled: Boolean = true
   private var desiredReferer: String? = null
@@ -139,6 +140,14 @@ class VlcPlayerView @JvmOverloads constructor(
     if (coerced == desiredVolume) return
     desiredVolume = coerced
     applyVolumeAndMute()
+  }
+
+  fun setRateLevel(rate: Float) {
+    if (released) return
+    val resolved = if (rate > 0f) rate else 1f
+    if (resolved == desiredRate) return
+    desiredRate = resolved
+    playerSession?.applyRate(resolved)
   }
 
   fun setRepeatMode(repeat: Boolean) {
@@ -342,6 +351,7 @@ class VlcPlayerView @JvmOverloads constructor(
     val fresh = PlayerSession(context, desiredInitOptions)
     fresh.applyResizeMode(desiredResizeMode)
     fresh.applyVolume(effectiveVolumeInt())
+    fresh.applyRate(desiredRate)
     if (attachedToWindow) {
       fresh.attach(videoLayout)
     }
@@ -600,6 +610,9 @@ class VlcPlayerView @JvmOverloads constructor(
 
       mediaPlayer.media = media
       media.release()
+      // Re-push a non-default rate for the new media — don't trust libvlc
+      // to carry it across media changes.
+      if (desiredRate != 1f) applyRate(desiredRate)
 
       if (autoPlay && attached) {
         playWhenReady()
@@ -659,6 +672,11 @@ class VlcPlayerView @JvmOverloads constructor(
 
     fun applyVolume(volume: Int) {
       runCatching { mediaPlayer.volume = volume.coerceIn(0, 100) }
+    }
+
+    // Rate is a request — live streams / some protocols ignore it.
+    fun applyRate(rate: Float) {
+      runCatching { mediaPlayer.rate = rate }
     }
 
     fun isPlaying(): Boolean =

@@ -52,6 +52,8 @@ const SOURCES: { name: string; url: string; note: string }[] = [
   },
 ];
 
+const RATES = [1, 1.5, 2, 0.5];
+
 const RESIZE_MODES: VlcPlayerResizeMode[] = [
   'contain',
   'cover',
@@ -83,6 +85,7 @@ export default function App() {
   const [lowCache, setLowCache] = useState(false);
   const [verboseInit, setVerboseInit] = useState(false);
   const [repeat, setRepeat] = useState(false);
+  const [rate, setRate] = useState(1);
   const [logs, setLogs] = useState<EventLog[]>([]);
   const [snapshotData, setSnapshotData] = useState<string | null>(null);
   const [progress, setProgress] = useState<Progress>({
@@ -152,6 +155,7 @@ export default function App() {
           source={source.url}
           paused={paused}
           repeat={repeat}
+          rate={rate}
           resizeMode={resizeMode}
           initOptions={verboseInit ? ['-vv'] : []}
           mediaOptions={[
@@ -282,6 +286,16 @@ export default function App() {
           }}
         >
           <Text style={styles.buttonText}>循环 {repeat ? '开' : '关'}</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.button, rate !== 1 && styles.buttonActive]}
+          onPress={() => {
+            const next = RATES[(RATES.indexOf(rate) + 1) % RATES.length]!;
+            setRate(next);
+            log('test', `rate=${next}`);
+          }}
+        >
+          <Text style={styles.buttonText}>倍速 {rate}x</Text>
         </Pressable>
       </View>
 

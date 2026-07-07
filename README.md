@@ -46,6 +46,7 @@ const [paused, setPaused] = useState(false);
   paused={paused}
   muted={isMuted}
   volume={0.8}
+  rate={1.5}
 />
 ```
 
@@ -104,6 +105,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 | `paused` | `boolean` | `false` | Pause playback |
 | `muted` | `boolean` | `false` | Mute audio |
 | `volume` | `number` | `1` | Volume, 0..1 |
+| `rate` | `number` | `1` | Playback rate (1 = normal). Changing it does not reload the media. VOD only — live streams and some protocols ignore the request. |
 | `repeat` | `boolean` | `false` | Loop playback |
 | `resizeMode` | `'contain' \| 'cover' \| 'stretch' \| 'original'` | `'contain'` | Scaling mode |
 | `hardwareDecoding` | `boolean` | `true` | Toggle hardware video decoding. Set `false` to force software decoding when the HW decoder produces artifacts. |

@@ -51,6 +51,10 @@ class VlcPlayerViewManager :
     view.setVolumeLevel(value)
   }
 
+  override fun setRate(view: VlcPlayerView, value: Float) {
+    view.setRateLevel(value)
+  }
+
   override fun setRepeat(view: VlcPlayerView, value: Boolean) {
     view.setRepeatMode(value)
   }

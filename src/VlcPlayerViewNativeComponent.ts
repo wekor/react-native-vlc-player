@@ -59,6 +59,7 @@ interface NativeProps extends ViewProps {
   paused?: CodegenTypes.WithDefault<boolean, false>;
   muted?: CodegenTypes.WithDefault<boolean, false>;
   volume?: CodegenTypes.WithDefault<CodegenTypes.Float, 1.0>;
+  rate?: CodegenTypes.WithDefault<CodegenTypes.Float, 1.0>;
   repeat?: CodegenTypes.WithDefault<boolean, false>;
   resizeMode?: CodegenTypes.WithDefault<string, 'contain'>;
   hardwareDecoding?: CodegenTypes.WithDefault<boolean, true>;

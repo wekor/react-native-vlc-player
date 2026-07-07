@@ -81,6 +81,12 @@ export type VlcPlayerViewProps = ViewProps & {
   muted?: boolean;
   /** 音量，0..1。@default 1 */
   volume?: number;
+  /**
+   * 播放速率，1 为原速，运行时可变（不会重载媒体）。仅点播可靠；
+   * 直播流及部分协议会忽略该请求（libvlc 层限制）。<=0 按 1 处理。
+   * @default 1
+   */
+  rate?: number;
   /** 播放完毕循环（仅点播）。@default false */
   repeat?: boolean;
 
