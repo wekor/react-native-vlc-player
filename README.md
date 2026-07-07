@@ -107,7 +107,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 | `muted` | `boolean` | `false` | Mute audio |
 | `volume` | `number` | `1` | Volume, 0..1 |
 | `rate` | `number` | `1` | Playback rate (1 = normal). Changing it does not reload the media. VOD only — live streams and some protocols ignore the request. |
-| `repeat` | `boolean` | `false` | Loop playback |
+| `repeat` | `boolean` | `false` | Loop playback (VOD). Toggling it reloads the media and restarts from the beginning, like `hardwareDecoding`. See the `onEnd` note below for per-platform loop behavior. |
 | `resizeMode` | `'contain' \| 'cover' \| 'stretch' \| 'original'` | `'contain'` | Scaling mode |
 | `hardwareDecoding` | `boolean` | `true` | Toggle hardware video decoding. Set `false` to force software decoding when the HW decoder produces artifacts. |
 | `initOptions` | `string[]` | `[]` | libvlc instance options, e.g. `['--rtsp-tcp']` |
@@ -127,6 +127,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 Notes:
 - `duration` / `currentTime` are in milliseconds.
 - In `onBuffer`, `percent` is the buffer fill 0..100; in `onProgress` it's the playback progress 0..100.
+- With `repeat` enabled, loop behavior differs per platform: Android loops seamlessly inside libvlc and fires no per-loop events; iOS (VLCKit 4 alpha) briefly reloads between passes and fires `onEnd` each pass. Don't rely on `onEnd` for loop counting.
 
 ## Imperative methods (ref)
 

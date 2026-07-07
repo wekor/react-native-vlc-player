@@ -298,6 +298,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   NSURL *_loadedURL;
   NSArray<NSString *> *_loadedMediaOptions;
   BOOL _loadedHardwareEnabled;
+  BOOL _loadedRepeat;
   NSString *_loadedReferer;
   NSString *_loadedUserAgent;
 
@@ -535,6 +536,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _desiredMuted = NO;
   _desiredVolume = 1.0f;
   _desiredRepeat = NO;
+  _loadedRepeat = NO;
   _desiredInitOptions = @[];
   _desiredMediaOptions = @[];
   _desiredResizeMode = VlcPlayerResizeModeContain;
@@ -599,6 +601,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
       ![_loadedURL isEqual:_desiredURL] ||
       ![_loadedMediaOptions isEqualToArray:_desiredMediaOptions] ||
       _loadedHardwareEnabled != _desiredHardwareEnabled ||
+      _loadedRepeat != _desiredRepeat ||
       !VLCEqualStrings(_loadedReferer, _desiredReferer) ||
       !VLCEqualStrings(_loadedUserAgent, _desiredUserAgent);
 
@@ -708,6 +711,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     for (NSString *option in _desiredMediaOptions) {
       [media addOption:option];
     }
+    // Seamless looping happens inside libvlc's input layer — no per-loop
+    // events, no re-open of network sources. libvlc can't cancel it on a
+    // running input, so toggling the prop reloads the media (repeat is in
+    // the needsMedia diff, same semantics as hardwareDecoding).
+    // handleLibVLCStopping's repeat branch is the safety net for streams
+    // where input-repeat doesn't engage.
     if (_desiredRepeat) {
       [media addOption:@":input-repeat=65535"];
     }
@@ -739,6 +748,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _loadedURL = url;
     _loadedMediaOptions = [_desiredMediaOptions copy];
     _loadedHardwareEnabled = _desiredHardwareEnabled;
+    _loadedRepeat = _desiredRepeat;
     _loadedReferer = [_desiredReferer copy];
     _loadedUserAgent = [_desiredUserAgent copy];
     _appliedPaused = YES;

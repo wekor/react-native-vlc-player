@@ -87,7 +87,13 @@ export type VlcPlayerViewProps = ViewProps & {
    * @default 1
    */
   rate?: number;
-  /** 播放完毕循环（仅点播）。@default false */
+  /**
+   * 播放完毕循环（仅点播）。播放中开关会重载媒体并从头播放（与
+   * `hardwareDecoding` 同语义）。循环行为有平台差异：Android 走 libvlc
+   * 内部无缝循环、循环期间不触发 onEnd；iOS（VLCKit 4 alpha）每圈之间
+   * 短暂重载并触发一次 onEnd。勿用 onEnd 计圈。
+   * @default false
+   */
   repeat?: boolean;
 
   /** 视频在容器内的缩放方式。@default 'contain' */

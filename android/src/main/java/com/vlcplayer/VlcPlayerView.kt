@@ -152,8 +152,12 @@ class VlcPlayerView @JvmOverloads constructor(
   }
 
   fun setRepeatMode(repeat: Boolean) {
-    if (released) return
+    if (released || repeat == desiredRepeat) return
     desiredRepeat = repeat
+    // Repeat is baked into the media as :input-repeat (seamless, zero-gap
+    // looping) — libvlc can't cancel it on a running input, so toggling
+    // reloads the media. Same semantics as hardwareDecoding.
+    if (currentUri != null) pendingApply = true
   }
 
   fun setHardwareDecoding(enabled: Boolean) {
@@ -596,8 +600,10 @@ class VlcPlayerView @JvmOverloads constructor(
       // `:network-caching=1500` / `:file-caching=1500` unless the flag is
       // already set, which would shadow user-provided values.
       mediaOptions.forEach(media::addOption)
-      // Safety net only: handleEndReached() actually drives repeat because
-      // libvlc 3.x's seamless input-repeat is unreliable.
+      // Seamless looping happens inside libvlc's input layer — no per-loop
+      // events, no re-open of network sources. Toggling the prop reloads
+      // the media (see setRepeatMode); handleEndReached's repeat branch is
+      // the safety net for streams where input-repeat doesn't engage.
       if (desiredRepeat) media.addOption(":input-repeat=65535")
       if (desiredHardwareEnabled) {
         // setDefaultMediaPlayerOptions respects user-set `:codec=` (via
