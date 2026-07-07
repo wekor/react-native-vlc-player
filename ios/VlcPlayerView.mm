@@ -1,5 +1,6 @@
 #import "VlcPlayerView.h"
 
+#import <React/RCTAssert.h>
 #import <React/RCTLog.h>
 #import <VLCKit/VLCKit.h>
 #import <objc/runtime.h>
@@ -189,39 +190,49 @@ static libvlc_media_player_t *VLCRawMediaPlayer(VLCMediaPlayer *player)
 - (void)handleLibVLCStopping;
 @end
 
+// Weak-holder handed to libvlc as event userData. The callback must not form
+// a fresh __weak reference to the view — if the view is mid-dealloc on
+// another thread, objc_initWeak on it is undefined behavior. Loading an
+// already-stored weak var is safe, so the bridge owns the weak ref. The view
+// retains the bridge for exactly the attach→detach window.
+@interface VlcEventBridge : NSObject
+@property (atomic, weak) VlcPlayerView *view;
+@end
+@implementation VlcEventBridge
+@end
+
 // libvlc event thread. Extract data sync (event struct is stack-allocated),
-// then hop to main.
+// then hop to main; the bridge resolves the view (or nil) at execution time.
 static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 {
   if (event == NULL) return;
-  VlcPlayerView *view = (__bridge VlcPlayerView *)userData;
-  __weak VlcPlayerView *weakView = view;
+  VlcEventBridge *bridge = (__bridge VlcEventBridge *)userData;
 
   switch (event->type) {
     case libvlc_MediaPlayerBuffering: {
       float cache = event->u.media_player_buffering.new_cache;
       dispatch_async(dispatch_get_main_queue(), ^{
-        [weakView handleLibVLCBufferingPercent:cache];
+        [bridge.view handleLibVLCBufferingPercent:cache];
       });
       break;
     }
     case libvlc_MediaPlayerTimeChanged: {
       int64_t timeMs = (int64_t)event->u.media_player_time_changed.new_time;
       dispatch_async(dispatch_get_main_queue(), ^{
-        [weakView handleLibVLCTimeChanged:timeMs];
+        [bridge.view handleLibVLCTimeChanged:timeMs];
       });
       break;
     }
     case libvlc_MediaPlayerLengthChanged: {
       int64_t lengthMs = (int64_t)event->u.media_player_length_changed.new_length;
       dispatch_async(dispatch_get_main_queue(), ^{
-        [weakView handleLibVLCLengthChanged:lengthMs];
+        [bridge.view handleLibVLCLengthChanged:lengthMs];
       });
       break;
     }
     case libvlc_MediaPlayerStopping: {
       dispatch_async(dispatch_get_main_queue(), ^{
-        [weakView handleLibVLCStopping];
+        [bridge.view handleLibVLCStopping];
       });
       break;
     }
@@ -263,6 +274,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   VLCMediaPlayer *_mediaPlayer;
   NSArray<NSString *> *_playerInitOptions;
+  VlcEventBridge *_eventBridge;  // alive for exactly the libvlc attach→detach window
 
   // Desired (props)
   NSURL *_desiredURL;
@@ -293,6 +305,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   NSString *_appliedAspectOverride;
 
   BOOL _destroyed;
+  // Set when an error stopped playback; cleared only by a new source or
+  // reload(). Keeps `_desired*` a pure props mirror — the error path must
+  // not fake a paused prop, or any unrelated prop update would silently
+  // retry the failing stream.
+  BOOL _haltedByError;
   BOOL _hasEmittedLoad;
   BOOL _hasEmittedEnd;
   BOOL _isBufferingState;
@@ -388,7 +405,13 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   (void)oldProps;
   const auto &newProps = *std::static_pointer_cast<VlcPlayerViewProps const>(props);
 
+  NSURL *previousURL = _desiredURL;
   _desiredURL = VLCURLFromString(VLCStringFromStdString(newProps.url));
+  // A new source is the declarative recovery from the error-halted state.
+  if (_haltedByError &&
+      !(_desiredURL == previousURL || [_desiredURL isEqual:previousURL])) {
+    _haltedByError = NO;
+  }
   _desiredPaused = newProps.paused;
   _desiredMuted = newProps.muted;
   {
@@ -469,6 +492,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 - (void)reload
 {
   if (_destroyed || _desiredURL == nil) return;
+  _haltedByError = NO;
   _desiredPaused = NO;
   [self releasePlayer];
   [self syncPlayer];
@@ -489,11 +513,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   // Stable libvlc render target. Initial frame matches the screen (per VLC
   // for iOS) — libvlc captures pipeline geometry at first use, and creating
-  // it at our (still-zero) bounds left libvlc in a broken state.
+  // it at our (still-zero) bounds left libvlc in a broken state. It keeps
+  // the screen-sized frame until the first applyDisplayOptions pass with
+  // real bounds; _videoView clips the overflow in the meantime.
   _videoOutputView = [[UIView alloc] initWithFrame:UIScreen.mainScreen.bounds];
   _videoOutputView.backgroundColor = UIColor.blackColor;
   [_videoView addSubview:_videoOutputView];
-  _videoOutputView.frame = _videoView.bounds;
 
   _drawable = [[VlcDrawable alloc] init];
   _drawable.target = _videoOutputView;
@@ -522,10 +547,10 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _appliedVolume = 1.0f;
   _appliedRate = 1.0f;
   _backgroundDate = nil;
+  _haltedByError = NO;
   _hasEmittedLoad = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
-  _videoView.contentMode = UIViewContentModeScaleAspectFit;
 }
 
 #pragma mark - Player sync
@@ -548,6 +573,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   if (_desiredURL == nil) {
     [self releasePlayer];
+    return;
+  }
+
+  // Error-halted: the player is already released; don't rebuild until a new
+  // source or reload() clears the flag.
+  if (_haltedByError) {
     return;
   }
 
@@ -606,8 +637,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
     libvlc_media_player_t *rawPlayer = VLCRawMediaPlayer(player);
     if (rawPlayer != NULL) {
+      VlcEventBridge *bridge = [VlcEventBridge new];
+      bridge.view = self;
+      _eventBridge = bridge;
       libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
-      void *userData = (__bridge void *)self;
+      void *userData = (__bridge void *)bridge;
       libvlc_event_attach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
       libvlc_event_attach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
       libvlc_event_attach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
@@ -755,10 +789,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
 - (void)releasePlayer
 {
-  if (!NSThread.isMainThread) {
-    dispatch_sync(dispatch_get_main_queue(), ^{ [self releasePlayer]; });
-    return;
-  }
+  // Every caller is on main (props, commands, notifications hopped via
+  // VLCRunOnMain, dealloc after prepareForRecycle). A dispatch_sync hop here
+  // would risk deadlock and, on the dealloc path, capturing self in a block
+  // is object-resurrection UB — so assert instead of hopping.
+  RCTAssertMainQueue();
 
   [self invalidatePendingPlayback];
 
@@ -783,14 +818,15 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   // libvlc_event_detach is sync — blocks until in-flight handlers complete.
   libvlc_media_player_t *rawPlayer = VLCRawMediaPlayer(player);
-  if (rawPlayer != NULL) {
+  if (rawPlayer != NULL && _eventBridge != nil) {
     libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
-    void *userData = (__bridge void *)self;
+    void *userData = (__bridge void *)_eventBridge;
     libvlc_event_detach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
     libvlc_event_detach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
     libvlc_event_detach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
     libvlc_event_detach(em, libvlc_MediaPlayerStopping,      VLCEventCallback, userData);
   }
+  _eventBridge = nil;
 
   @try {
     // pause→drawable→stop avoids a libvlc_media_retain race during RTSP teardown.
@@ -1114,7 +1150,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 - (void)emitError:(NSString *)message shouldStopPlayback:(BOOL)shouldStopPlayback
 {
   if (shouldStopPlayback) {
-    _desiredPaused = YES;
+    _haltedByError = YES;
     [self releasePlayer];
   }
 
