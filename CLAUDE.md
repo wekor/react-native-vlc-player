@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`@wekor/react-native-vlc-player` — a Fabric-only React Native video player wrapping VLCKit (iOS) and libvlc-all (Android). Targets RN 0.74+, iOS 15.1+, Android minSdk 24. The legacy bridge is **not** supported.
+`@wekor/react-native-vlc-player` — a Fabric-only React Native video player wrapping MobileVLCKit (iOS) and libvlc-all (Android). Targets RN 0.74+, iOS 15.1+, Android minSdk 24. The legacy bridge is **not** supported.
 
 This is a Yarn workspaces monorepo: the library lives at the root; `example/` is an Expo Router app used to develop and test the native code. Node version is pinned in `.nvmrc` (v24.13.0). Use `yarn` — `npm` will break the workspace.
 
@@ -66,10 +66,16 @@ When extending state, follow this split — don't call into VLCKit/libvlc from a
 
 ### iOS specifics (`ios/VlcPlayerView.mm`)
 
-- Depends on `VLCKit 4.0.0a19` (alpha). VLCKit's modulemap excludes `<vlc/libvlc*.h>`, so the file forward-declares the libvlc symbols it needs (buffering/time/length/stopping events) and reaches into `VLCMediaPlayer`'s private `_playerInstance` ivar via `objc/runtime.h`. Reason: VLCKit's Obj-C wrappers drop cache values and don't surface buffering percent. **Don't try to replace this with VLCKit's published API — it doesn't exist for these events.**
-- `VlcDrawable` is an `NSObject<VLCDrawable>` forwarder, modeled on VLC-iOS's `PlaybackService`. VLCKit 4 alpha's new rendering pipeline only engages on this path; handing libvlc a `UIView` directly falls back to a vout that ignores `resizeMode`. The forwarder also disables touches on the libvlc-injected child view to suppress libvlc's built-in tap-to-pause gesture.
-- libvlc never reports "connection failed" for unreachable URLs — it sits in Opening forever. `kVLCOpeningTimeout = 8.0` caps the wait and emits `onError`.
-- Backgrounding: registers for `UIApplication` lifecycle notifications; pauses on background, resumes on foreground with a fallback delay because libvlc sometimes doesn't restart cleanly.
+- Depends on `MobileVLCKit 3.7.3` — the same version the official VLC-iOS app pins. Uses **only the published API**; no private ivars, no libvlc header tricks. The architecture mirrors VLC-iOS's `VLCPlaybackService`: a `VLCMediaListPlayer` holding a single-item `VLCMediaList`, with repeat handled natively via `VLCRepeatMode`.
+- **One session per media, drained off-main**: libvlc 3's `stop` synchronously joins the input thread and can block for tens of seconds on a wedged network stream, so it must never run on the main thread. Media swaps/teardowns detach the whole session (delegates nil'ed, ivars cleared) and `stop`/`parseStop` it on a serial background queue (`VlcTeardownQueue`), then build a fresh session. Don't "optimize" this back to player reuse — that reintroduces main-thread `stop`.
+- **⚠️ LAN RTSP requires the Apple-approved `com.apple.developer.networking.multicast` entitlement** (live555 discovers the local IP via multicast; iOS 16+ blocks it otherwise → ~1min first frame + laggy session, VLCKit issues #560/#703). The official VLC app ships this entitlement; consumers of this library must request it from Apple themselves for LAN RTSP.
+- The drawable is a plain `UIView` (`_videoView`, set as `contentView`) handed to `VLCMediaListPlayer` **at construction** — VLC-iOS documents that video decoding permanently fails if no view is available on init. It has `userInteractionEnabled = NO` so libvlc's vout subviews never swallow React gestures.
+- Every media gets VLC-iOS's baseline options first (`:network-caching=999`, `:avcodec-skiploopfilter=1`); user `mediaOptions` are added after and therefore override. `subsdec-encoding=Windows-1252` (also a VLC-iOS default) is deliberately NOT applied — libvlc's charset auto-detection is a better default for CJK subtitles.
+- MobileVLCKit 3.x exposes no buffering percentage; `onBuffer` reports edges only (`percent` 0 while buffering, 100 when cleared).
+- libvlc never reports "connection failed" for unreachable URLs — it sits in Opening forever (Buffering fires even when no byte arrives). `kOpeningTimeoutSeconds = 8.0` caps the wait and emits `onError`; only Playing/timeChanged cancel it.
+- Snapshots: `saveVideoSnapshotAt:withWidth:andHeight:` (0×0 = native size) has no failure callback, so requests are FIFO-queued, matched to `mediaPlayerSnapshot:` delegate callbacks, and failed after a 3s timeout.
+- `resizeMode`: contain = libvlc defaults (aspect NULL, scale 0); cover = `scaleFactor` computed exactly like VLC-iOS "fill to screen" (needs `videoSize`, so it's re-applied on ESAdded/Playing and in `layoutSubviews`); stretch = `videoAspectRatio` set to the view's own aspect; original = `scaleFactor` 1.
+- Backgrounding: pauses on `UIApplicationDidEnterBackground`, resumes on `WillEnterForeground` (a `_resumeOnForeground` flag distinguishes user pauses from lifecycle pauses).
 
 ### Android specifics (`android/src/main/java/com/vlcplayer/VlcPlayerView.kt`)
 

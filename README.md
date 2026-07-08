@@ -127,7 +127,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 Notes:
 - `duration` / `currentTime` are in milliseconds.
 - In `onBuffer`, `percent` is the buffer fill 0..100; in `onProgress` it's the playback progress 0..100.
-- With `repeat` enabled, loop behavior differs per platform: Android loops seamlessly inside libvlc and fires no per-loop events; iOS (VLCKit 4 alpha) briefly reloads between passes and fires `onEnd` each pass. Don't rely on `onEnd` for loop counting.
+- With `repeat` enabled, loop behavior differs per platform: Android loops seamlessly inside libvlc and fires no per-loop events; iOS loops via VLCMediaListPlayer's native repeat mode and fires `onEnd` each pass. Don't rely on `onEnd` for loop counting.
 
 ## Imperative methods (ref)
 
@@ -189,7 +189,7 @@ The hardware decoder may not support the stream. Force software decoding:
 
 Changing `hardwareDecoding` reloads the media. Under the hood:
 
-- iOS (VLCKit 4) adds `:codec=avcodec,all` so libvlc tries the FFmpeg software
+- iOS (MobileVLCKit 3) adds `:codec=avcodec,all` so libvlc tries the FFmpeg software
   decoder before VideoToolbox. Same path as VLC for iOS's Settings → Hardware
   decoding → Off.
 - Android (libvlc-android 3.x) calls `Media.setHWDecoderEnabled(false, false)`,

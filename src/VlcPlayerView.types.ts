@@ -88,10 +88,10 @@ export type VlcPlayerViewProps = ViewProps & {
    */
   rate?: number;
   /**
-   * 播放完毕循环（仅点播）。播放中开关会重载媒体并从头播放（与
-   * `hardwareDecoding` 同语义）。循环行为有平台差异：Android 走 libvlc
-   * 内部无缝循环、循环期间不触发 onEnd；iOS（VLCKit 4 alpha）每圈之间
-   * 短暂重载并触发一次 onEnd。勿用 onEnd 计圈。
+   * 播放完毕循环（仅点播）。iOS 走 VLCMediaListPlayer 原生 repeatMode，
+   * 运行时可切换、不重载媒体，每圈结束触发一次 onEnd；Android 走 libvlc
+   * 内部无缝循环、循环期间不触发 onEnd，播放中开关会重载媒体。
+   * 勿用 onEnd 计圈。
    * @default false
    */
   repeat?: boolean;
@@ -103,7 +103,7 @@ export type VlcPlayerViewProps = ViewProps & {
    * 是否启用硬件解码。出现花屏 / 颜色错乱 / 解码失败时改成 `false` 强制纯软解
    * 排查。修改此值会重新加载媒体，不能在播放中无缝切换。
    *
-   * - iOS 走 VLCKit 4 / VideoToolbox；关闭硬解通过 `:codec=avcodec,all`
+   * - iOS 走 MobileVLCKit 3 / VideoToolbox；关闭硬解通过 `:codec=avcodec,all`
    *   实现（与 VLC-iOS 官方应用一致）。
    * - Android 走 libvlc-android 的 `setHWDecoderEnabled` 接口。
    *

@@ -84,6 +84,9 @@ export default function App() {
   // initOptions 切换预期触发 "Creating player session"（重建 LibVLC，负向对照）。
   const [lowCache, setLowCache] = useState(false);
   const [verboseInit, setVerboseInit] = useState(false);
+  // RTSP over TCP。官方 VLC-iOS 该设置默认关闭（走 UDP）——部分摄像头的
+  // TCP interleaved 路径极慢甚至不通，强制 TCP 会把"能秒开"变成"打不开"。
+  const [rtspTcp, setRtspTcp] = useState(false);
   const [repeat, setRepeat] = useState(false);
   const [rate, setRate] = useState(1);
   const [logs, setLogs] = useState<EventLog[]>([]);
@@ -163,8 +166,8 @@ export default function App() {
           resizeMode={resizeMode}
           initOptions={verboseInit ? ['-vv'] : []}
           mediaOptions={[
-            ':rtsp-tcp',
-            lowCache ? ':network-caching=300' : ':network-caching=1500',
+            ...(rtspTcp ? [':rtsp-tcp'] : []),
+            ...(lowCache ? [':network-caching=300'] : []),
           ]}
           onLoad={({ nativeEvent: { duration, videoSize } }) => {
             log(
@@ -259,11 +262,14 @@ export default function App() {
           onPress={() => {
             const next = !lowCache;
             setLowCache(next);
-            log('test', `caching→${next ? 300 : 1500} 预期:仅 Loading media`);
+            log(
+              'test',
+              `caching→${next ? 300 : '默认999'} 预期:仅 Loading media`
+            );
           }}
         >
           <Text style={styles.buttonText}>
-            缓存 {lowCache ? '300' : '1500'}
+            缓存 {lowCache ? '300' : '默认'}
           </Text>
         </Pressable>
         <Pressable
@@ -280,6 +286,16 @@ export default function App() {
           <Text style={styles.buttonText}>
             init {verboseInit ? '-vv' : '默认'}
           </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.button, rtspTcp && styles.buttonActive]}
+          onPress={() => {
+            const next = !rtspTcp;
+            setRtspTcp(next);
+            log('test', `rtsp-tcp=${next}（官方默认关/UDP）`);
+          }}
+        >
+          <Text style={styles.buttonText}>TCP {rtspTcp ? '开' : '关'}</Text>
         </Pressable>
         <Pressable
           style={[styles.button, repeat && styles.buttonActive]}
