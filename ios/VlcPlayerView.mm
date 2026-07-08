@@ -1,5 +1,6 @@
 #import "VlcPlayerView.h"
 
+#import <AVFoundation/AVFoundation.h>
 #import <React/RCTAssert.h>
 #import <React/RCTLog.h>
 #import <VLCKit/VLCKit.h>
@@ -170,6 +171,23 @@ static inline void VLCRunOnMain(dispatch_block_t block)
   }
 }
 
+// Ports VLC-iOS treats as "external audio playback device" — wired
+// headphones and any Bluetooth/USB audio sink.
+static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route)
+{
+  for (AVAudioSessionPortDescription *port in route.outputs) {
+    NSString *type = port.portType;
+    if ([type isEqualToString:AVAudioSessionPortHeadphones] ||
+        [type isEqualToString:AVAudioSessionPortBluetoothA2DP] ||
+        [type isEqualToString:AVAudioSessionPortBluetoothHFP] ||
+        [type isEqualToString:AVAudioSessionPortBluetoothLE] ||
+        [type isEqualToString:AVAudioSessionPortUSBAudio]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
 // Reach into VLCMediaPlayer's private `_playerInstance` ivar — VLCKit's
 // wrapper drops libvlc's cache values, so we hook libvlc directly.
 static libvlc_media_player_t *VLCRawMediaPlayer(VLCMediaPlayer *player)
@@ -319,6 +337,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   BOOL _hasEmittedEnd;
   BOOL _isBufferingState;
   BOOL _userInitiatedStop;  // set before our [stop]; consumed by Stopping handler
+  // While an audio interruption is in flight, recovery belongs to the
+  // interruption handler alone — didBecomeActive must not arm its
+  // reload-fallback, whose media reload showed up as "connecting AirPods
+  // restarts the video".
+  BOOL _audioInterruptionActive;
   NSDate *_backgroundDate;
   NSUInteger _generation;
   NSUInteger _playIssuedGeneration;
@@ -328,6 +351,14 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   // Cached at emitLoadIfReady so the libvlc time-changed handler can compute
   // percent without touching `_mediaPlayer.media` (which races with media swaps).
   int64_t _loadedDurationMs;
+
+  // Position-restore net: audio route changes (e.g. connecting AirPods) can
+  // kill the input, after which any play()/reload restarts the media at zero.
+  // We track the last playback position and restore it on the next Playing.
+  int64_t _lastTimeMs;
+  int64_t _pendingRestoreTimeMs;
+  BOOL _mediaEverPlayed;
+  NSURL *_lastLoadedURL;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -499,6 +530,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   if (_destroyed || _desiredURL == nil) return;
   _haltedByError = NO;
   _desiredPaused = NO;
+  _lastTimeMs = 0; // explicit reconnect starts clean
   [self releasePlayer];
   [self syncPlayer];
 }
@@ -744,6 +776,19 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
                VLCRedactedURLString(url),
                [_desiredMediaOptions componentsJoinedByString:@", "]);
 
+    // Same-URL reload (resume fallback, background return, route recovery):
+    // arm a position restore so the viewer continues where they were. A real
+    // source change starts clean at zero.
+    if ([url isEqual:_lastLoadedURL] && _lastTimeMs > 1500) {
+      _pendingRestoreTimeMs = _lastTimeMs;
+      NSLog(@"[VlcPlayer] same-URL reload, will restore position %lldms", _pendingRestoreTimeMs);
+    } else {
+      _pendingRestoreTimeMs = 0;
+      _lastTimeMs = 0;
+    }
+    _mediaEverPlayed = NO;
+    _lastLoadedURL = url;
+
     player.media = media;
     _loadedURL = url;
     _loadedMediaOptions = [_desiredMediaOptions copy];
@@ -791,6 +836,14 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   _playIssuedGeneration = generation;
   _appliedPaused = NO;
+
+  // play() on a Stopped player restarts the media at zero (route changes like
+  // connecting AirPods can stop a live input) — arm a position restore first.
+  VLCMediaPlayerState state = player.state;
+  if (_mediaEverPlayed && state == VLCMediaPlayerStateStopped && _lastTimeMs > 1500) {
+    _pendingRestoreTimeMs = _lastTimeMs;
+  }
+  NSLog(@"[VlcPlayer] issuing play (state=%ld, restore=%lldms)", (long)state, _pendingRestoreTimeMs);
 
   @try {
     [player play];
@@ -1007,6 +1060,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     if (strongSelf->_mediaPlayer.state == VLCMediaPlayerStatePlaying) {
       return;
     }
+    NSLog(@"[VlcPlayer] resume fallback fired — reloading media");
     strongSelf->_loadedURL = nil;
     [strongSelf syncPlayer];
   });
@@ -1045,6 +1099,14 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
              selector:@selector(handleAppDidBecomeActive:)
                  name:UIApplicationDidBecomeActiveNotification
                object:nil];
+  [center addObserver:self
+             selector:@selector(handleAudioSessionInterruption:)
+                 name:AVAudioSessionInterruptionNotification
+               object:AVAudioSession.sharedInstance];
+  [center addObserver:self
+             selector:@selector(handleAudioSessionRouteChange:)
+                 name:AVAudioSessionRouteChangeNotification
+               object:AVAudioSession.sharedInstance];
 }
 
 - (void)removeLifecycleObservers
@@ -1052,6 +1114,8 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
   [center removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
   [center removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
+  [center removeObserver:self name:AVAudioSessionInterruptionNotification object:AVAudioSession.sharedInstance];
+  [center removeObserver:self name:AVAudioSessionRouteChangeNotification object:AVAudioSession.sharedInstance];
 }
 
 - (void)handleAppDidEnterBackground:(__unused NSNotification *)notification
@@ -1062,6 +1126,10 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   [self invalidatePendingPlayback];
   _appliedPaused = YES;
+  // Real backgrounding supersedes any in-flight audio interruption — iOS
+  // often never delivers the interruption-Ended, and a stuck flag would
+  // block the didBecomeActive recovery forever.
+  _audioInterruptionActive = NO;
   _backgroundDate = [NSDate date];
 
   // Don't touch drawable — keep libvlc's render pipeline configured.
@@ -1075,8 +1143,15 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _backgroundDate = nil;
     return;
   }
+  // Audio interruption in flight (AirPods connect, call UI): recovery is the
+  // interruption handler's job; the reload-fallback below must stay out.
+  if (_audioInterruptionActive) {
+    NSLog(@"[VlcPlayer] didBecomeActive ignored — audio interruption active");
+    return;
+  }
 
   NSTimeInterval timeAway = _backgroundDate == nil ? 0 : [[NSDate date] timeIntervalSinceDate:_backgroundDate];
+  NSLog(@"[VlcPlayer] didBecomeActive (timeAway=%.1fs)", timeAway);
   _backgroundDate = nil;
 
   if (_mediaPlayer == nil || timeAway > kVLCBackgroundResumeThreshold) {
@@ -1087,6 +1162,85 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   [self playPlayer];
   [self scheduleResumeFallbackForGeneration:_generation];
+}
+
+#pragma mark - Audio session
+// AVAudioSession notifications arrive on a private queue — handlers hop to
+// main before touching any state.
+
+// Phone call / alarm / Siri. Mirrors VLC-iOS: pause when the interruption
+// begins, resume only when the system explicitly says ShouldResume (call
+// ended and iOS considers us entitled to continue). The generation bump on
+// pause is what re-arms playPlayer for that resume; if we never paused here,
+// the play-issuance gate keeps a stray ShouldResume from restarting a
+// user-paused or finished player.
+- (void)handleAudioSessionInterruption:(NSNotification *)notification
+{
+  NSDictionary *userInfo = notification.userInfo;
+  NSUInteger type = [userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+  NSUInteger options = [userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed) return;
+
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+      NSLog(@"[VlcPlayer] audio interruption began (playing=%d)", strongSelf->_mediaPlayer.isPlaying);
+      strongSelf->_audioInterruptionActive = YES;
+      if (strongSelf->_mediaPlayer.isPlaying) {
+        [strongSelf invalidatePendingPlayback];
+        strongSelf->_appliedPaused = YES;
+        [strongSelf->_mediaPlayer pause];
+      }
+      return;
+    }
+    NSLog(@"[VlcPlayer] audio interruption ended (options=%lu, state=%ld)", (unsigned long)options,
+          (long)strongSelf->_mediaPlayer.state);
+    strongSelf->_audioInterruptionActive = NO;
+    if (type == AVAudioSessionInterruptionTypeEnded &&
+        (options & AVAudioSessionInterruptionOptionShouldResume) != 0 &&
+        !strongSelf->_desiredPaused &&
+        strongSelf->_backgroundDate == nil) {
+      if (strongSelf->_mediaPlayer.state == VLCMediaPlayerStatePaused) {
+        // Player survived paused — seamless resume, no reload, no flash.
+        [strongSelf playPlayer];
+      } else if (strongSelf->_mediaEverPlayed) {
+        // The route change killed the input; a blind play() would restart at
+        // zero. Reload the same URL — loadDesiredMedia arms the position
+        // restore, so playback continues where it was.
+        NSLog(@"[VlcPlayer] interruption left player stopped — reloading with position restore");
+        strongSelf->_loadedURL = nil;
+        [strongSelf syncPlayer];
+      }
+    }
+  });
+}
+
+// Headphones unplugged / Bluetooth audio dropped: iOS convention (and
+// VLC-iOS behavior) is to pause instead of blasting the built-in speaker.
+// Deliberately no auto-resume when a device comes back — the user decides.
+- (void)handleAudioSessionRouteChange:(NSNotification *)notification
+{
+  NSDictionary *userInfo = notification.userInfo;
+  NSUInteger reason = [userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+  if (reason != AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
+    return;
+  }
+  AVAudioSessionRouteDescription *previousRoute = userInfo[AVAudioSessionRouteChangePreviousRouteKey];
+  if (previousRoute != nil && !VLCRouteHasExternalAudioOutput(previousRoute)) {
+    return;
+  }
+
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed) return;
+    if (!strongSelf->_mediaPlayer.isPlaying) return;
+    [strongSelf invalidatePendingPlayback];
+    strongSelf->_appliedPaused = YES;
+    [strongSelf->_mediaPlayer pause];
+  });
 }
 
 #pragma mark - Events
@@ -1220,6 +1374,16 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
           break;
         }
         strongSelf->_appliedPaused = NO;
+        strongSelf->_mediaEverPlayed = YES;
+        // Restore the pre-disruption position (VOD only — live has none).
+        if (strongSelf->_pendingRestoreTimeMs > 0) {
+          int64_t restoreMs = strongSelf->_pendingRestoreTimeMs;
+          strongSelf->_pendingRestoreTimeMs = 0;
+          if (strongSelf->_loadedDurationMs > 0 && restoreMs < strongSelf->_loadedDurationMs) {
+            NSLog(@"[VlcPlayer] restoring position to %lldms", restoreMs);
+            strongSelf->_mediaPlayer.time = [VLCTime timeWithInt:(int)restoreMs];
+          }
+        }
         [strongSelf cancelOpeningTimeout];
         [strongSelf cancelResumeFallback];
 
@@ -1302,6 +1466,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 {
   if (_destroyed) return;
   if (_mediaPlayer == nil) return;
+  _lastTimeMs = timeMs < 0 ? 0 : timeMs;
   int64_t durationMs = _loadedDurationMs;
   if (durationMs <= 0) return;  // live stream or pre-load
   int64_t safeTime = timeMs < 0 ? 0 : timeMs;

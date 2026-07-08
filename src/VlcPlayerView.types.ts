@@ -75,7 +75,12 @@ export type VlcPlayerViewProps = ViewProps & {
    */
   source?: VideoSource;
 
-  /** 暂停。受控属性。@default false */
+  /**
+   * 暂停。受控属性。@default false
+   *
+   * 注意：来电中断、拔耳机/蓝牙断开等系统事件会让原生侧按平台惯例自动暂停，
+   * 此时该 prop 不会被改写（详见 README 的 Events 注意事项）。
+   */
   paused?: boolean;
   /** 静音。@default false */
   muted?: boolean;

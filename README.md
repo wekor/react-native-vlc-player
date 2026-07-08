@@ -128,6 +128,7 @@ Notes:
 - `duration` / `currentTime` are in milliseconds.
 - In `onBuffer`, `percent` is the buffer fill 0..100; in `onProgress` it's the playback progress 0..100.
 - With `repeat` enabled, loop behavior differs per platform: Android loops seamlessly inside libvlc and fires no per-loop events; iOS (VLCKit 4 alpha) briefly reloads between passes and fires `onEnd` each pass. Don't rely on `onEnd` for loop counting.
+- The player follows platform audio conventions automatically: it pauses when headphones (wired or Bluetooth) disconnect and on audio interruptions (phone calls, alarms; audio-focus loss on Android). After an interruption it resumes only when the OS says it should (iOS `ShouldResume` / Android transient-focus regain); it never auto-resumes after a headphone unplug. These native pauses do not mutate the `paused` prop.
 
 ## Imperative methods (ref)
 
@@ -199,6 +200,22 @@ Changing `hardwareDecoding` reloads the media. Under the hood:
 Do not also pass `:codec=...` or `:no-hw-dec` in `mediaOptions` — the two
 platforms use different underlying option strings and your override will be
 clobbered.
+
+### Black screen after returning from background (iOS)
+
+A VLCKit platform limitation — the official VLC iOS app shows the same
+behavior (audio resumes, video stays black; media reloads and video-track
+toggling were both tried and don't recover the vout). Recommended workaround:
+reload on foreground from JS:
+
+```tsx
+useEffect(() => {
+  const sub = AppState.addEventListener('change', (s) => {
+    if (s === 'active') ref.current?.reload();
+  });
+  return () => sub.remove();
+}, []);
+```
 
 ### Audio only (or video only)
 

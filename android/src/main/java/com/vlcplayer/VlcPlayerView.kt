@@ -1,8 +1,15 @@
 package com.vlcplayer
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
@@ -68,8 +75,71 @@ class VlcPlayerView @JvmOverloads constructor(
   // Reused by PixelCopy.request to avoid a Handler alloc per snapshot.
   private val mainHandler = Handler(Looper.getMainLooper())
 
+  // ---- Audio session behaviors (platform convention, parity with iOS) ----
+
+  // Wired headphones unplugged / Bluetooth audio dropped. Android's canonical
+  // signal is ACTION_AUDIO_BECOMING_NOISY — pause instead of switching to the
+  // loudspeaker. Deliberately no auto-resume; the user decides.
+  private val becomingNoisyReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      if (released || intent?.action != AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
+      playerSession?.takeIf { it.isPlaying() }?.pause()
+    }
+  }
+
+  private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+  private var hasAudioFocus = false
+  private var resumeOnFocusGain = false
+
+  // Delivered on the main thread (registered with the main-looper handler).
+  private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
+    if (released) return@OnAudioFocusChangeListener
+    when (change) {
+      AudioManager.AUDIOFOCUS_LOSS -> {
+        // Another app took playback over for good (e.g. a music app).
+        resumeOnFocusGain = false
+        playerSession?.pause()
+        abandonAudioFocus()
+      }
+      AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+        // Phone call or similar; remember whether we were the one playing.
+        resumeOnFocusGain = playerSession?.isPlaying() == true
+        playerSession?.pause()
+      }
+      // LOSS_TRANSIENT_CAN_DUCK is not handled: on API 26+ the system ducks
+      // automatically because we don't opt out via setWillPauseWhenDucked.
+      AudioManager.AUDIOFOCUS_GAIN -> {
+        if (resumeOnFocusGain && shouldPlayWhenReady && attachedToWindow && currentUri != null) {
+          playerSession?.playWhenReady()
+        }
+        resumeOnFocusGain = false
+      }
+    }
+  }
+
+  private val audioFocusRequest: AudioFocusRequest? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+        .setAudioAttributes(
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+            .build(),
+        )
+        .setOnAudioFocusChangeListener(audioFocusListener, mainHandler)
+        .build()
+    } else {
+      null
+    }
+
   init {
     ProcessLifecycleOwner.get().lifecycle.addObserver(this)
+    val noisyFilter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      context.registerReceiver(becomingNoisyReceiver, noisyFilter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      context.registerReceiver(becomingNoisyReceiver, noisyFilter)
+    }
   }
 
   // Fabric's ReactViewGroup swallows requestLayout; libvlc's programmatically-
@@ -279,6 +349,8 @@ class VlcPlayerView @JvmOverloads constructor(
     pendingApply = false
     removeCallbacks(measureAndLayoutRunnable)
     ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
+    runCatching { context.unregisterReceiver(becomingNoisyReceiver) }
+    abandonAudioFocus()
     playerSession?.release()
     playerSession = null
     currentUri = null
@@ -371,6 +443,34 @@ class VlcPlayerView @JvmOverloads constructor(
     }
     playerSession = fresh
     return fresh
+  }
+
+  // Called from the session's Playing handler — focus follows actual
+  // playback, so a paused or failed player never holds it.
+  private fun requestAudioFocusIfNeeded() {
+    if (hasAudioFocus || released) return
+    @Suppress("DEPRECATION")
+    val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      audioManager.requestAudioFocus(requireNotNull(audioFocusRequest))
+    } else {
+      audioManager.requestAudioFocus(
+        audioFocusListener,
+        AudioManager.STREAM_MUSIC,
+        AudioManager.AUDIOFOCUS_GAIN,
+      )
+    }
+    hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+  }
+
+  private fun abandonAudioFocus() {
+    if (!hasAudioFocus) return
+    hasAudioFocus = false
+    @Suppress("DEPRECATION")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      audioManager.abandonAudioFocusRequest(requireNotNull(audioFocusRequest))
+    } else {
+      audioManager.abandonAudioFocus(audioFocusListener)
+    }
   }
 
   private fun effectiveVolumeInt(): Int =
@@ -520,6 +620,7 @@ class VlcPlayerView @JvmOverloads constructor(
     }
 
     private fun handlePlaying() {
+      requestAudioFocusIfNeeded()
       if (isBufferingState) {
         isBufferingState = false
         emitBuffer(isBuffering = false, percent = 100f)

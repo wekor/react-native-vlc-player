@@ -70,6 +70,7 @@ When extending state, follow this split — don't call into VLCKit/libvlc from a
 - `VlcDrawable` is an `NSObject<VLCDrawable>` forwarder, modeled on VLC-iOS's `PlaybackService`. VLCKit 4 alpha's new rendering pipeline only engages on this path; handing libvlc a `UIView` directly falls back to a vout that ignores `resizeMode`. The forwarder also disables touches on the libvlc-injected child view to suppress libvlc's built-in tap-to-pause gesture.
 - libvlc never reports "connection failed" for unreachable URLs — it sits in Opening forever. `kVLCOpeningTimeout = 8.0` caps the wait and emits `onError`.
 - Backgrounding: registers for `UIApplication` lifecycle notifications; pauses on background, resumes on foreground with a fallback delay because libvlc sometimes doesn't restart cleanly.
+- Audio session behaviors mirror VLC-iOS: pause on `AVAudioSession` interruption (auto-resume only on the system's `ShouldResume` hint) and on headphone/Bluetooth route loss (never auto-resumes). These native pauses don't touch `_desiredPaused`; the interruption path bumps the generation, which is what re-arms `playPlayer` for the resume.
 
 ### Android specifics (`android/src/main/java/com/vlcplayer/VlcPlayerView.kt`)
 
@@ -77,6 +78,7 @@ When extending state, follow this split — don't call into VLCKit/libvlc from a
 - `requestLayout` is overridden to post a manual `measure`/`layout` pump, because Fabric's `ReactViewGroup` swallows `requestLayout`. Without this, libvlc's programmatically-added inner `SurfaceView` never gets a size and `play()` stalls in `areSurfacesWaiting`.
 - Snapshots use `PixelCopy.request` (SurfaceView pixels live on a Surface owned by SurfaceFlinger; this is the only public readback API). PNG encoding runs on a dedicated single-thread executor to keep the UI thread free.
 - Background/foreground is observed via `ProcessLifecycleOwner` (whole-app, not per-Activity).
+- Audio focus is requested when libvlc reports Playing (so a paused/failed player never holds it) and abandoned on release or permanent loss; transient loss pauses and resumes on regain. `ACTION_AUDIO_BECOMING_NOISY` (headphone unplug / BT drop) pauses with no auto-resume.
 - `PlayerSession` (in the same file) wraps a `LibVLC` + `MediaPlayer` pair so the parent view doesn't have to track libvlc state directly.
 
 ### Two-level libvlc configuration
