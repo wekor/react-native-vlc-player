@@ -671,7 +671,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     // source change starts clean at zero.
     if ([url isEqual:_lastLoadedURL] && _lastTimeMs > 1500) {
       _pendingRestoreTimeMs = _lastTimeMs;
-      NSLog(@"[VlcPlayer] same-URL reload, will restore position %lldms", _pendingRestoreTimeMs);
     } else {
       _pendingRestoreTimeMs = 0;
       _lastTimeMs = 0;
@@ -733,7 +732,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   if (_mediaEverPlayed && state == VLCMediaPlayerStateStopped && _lastTimeMs > 1500) {
     _pendingRestoreTimeMs = _lastTimeMs;
   }
-  NSLog(@"[VlcPlayer] issuing play (state=%ld, restore=%lldms)", (long)state, _pendingRestoreTimeMs);
 
   @try {
     [player play];
@@ -943,7 +941,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     if (strongSelf->_mediaPlayer.state == VLCMediaPlayerStatePlaying) {
       return;
     }
-    NSLog(@"[VlcPlayer] resume fallback fired — reloading media");
     strongSelf->_loadedURL = nil;
     [strongSelf syncPlayer];
   });
@@ -1033,14 +1030,12 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   // after app switch" regression (worked in 0.2.0, broken by this flag).
   if (_audioInterruptionActive) {
     if (_backgroundDate == nil) {
-      NSLog(@"[VlcPlayer] didBecomeActive ignored — audio interruption active");
       return;
     }
     _audioInterruptionActive = NO;
   }
 
   NSTimeInterval timeAway = _backgroundDate == nil ? 0 : [[NSDate date] timeIntervalSinceDate:_backgroundDate];
-  NSLog(@"[VlcPlayer] didBecomeActive (timeAway=%.1fs)", timeAway);
   _backgroundDate = nil;
 
   // Revive the vout's sample-buffer layer if backgrounding failed it — must
@@ -1085,7 +1080,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
       if (strongSelf->_backgroundDate != nil) {
         return;
       }
-      NSLog(@"[VlcPlayer] audio interruption began (playing=%d)", strongSelf->_mediaPlayer.isPlaying);
       strongSelf->_audioInterruptionActive = YES;
       if (strongSelf->_mediaPlayer.isPlaying) {
         [strongSelf invalidatePendingPlayback];
@@ -1094,8 +1088,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
       }
       return;
     }
-    NSLog(@"[VlcPlayer] audio interruption ended (options=%lu, state=%ld)", (unsigned long)options,
-          (long)strongSelf->_mediaPlayer.state);
     strongSelf->_audioInterruptionActive = NO;
     if (type == AVAudioSessionInterruptionTypeEnded &&
         (options & AVAudioSessionInterruptionOptionShouldResume) != 0 &&
@@ -1108,7 +1100,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
         // The route change killed the input; a blind play() would restart at
         // zero. Reload the same URL — loadDesiredMedia arms the position
         // restore, so playback continues where it was.
-        NSLog(@"[VlcPlayer] interruption left player stopped — reloading with position restore");
         strongSelf->_loadedURL = nil;
         [strongSelf syncPlayer];
       }
