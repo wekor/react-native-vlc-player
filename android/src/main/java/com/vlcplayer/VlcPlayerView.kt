@@ -586,6 +586,10 @@ class VlcPlayerView @JvmOverloads constructor(
     // Cached from LengthChanged so per-tick handlers skip the JNI
     // mediaPlayer.length query on every TimeChanged.
     private var cachedLengthMs: Long = 0
+    // Position-restore net: same-URI reloads (repeat/hardware toggles) must
+    // continue where playback was, not restart at zero.
+    private var lastTimeMs: Long = 0
+    private var pendingRestoreMs: Long = 0
 
     private val eventListener = MediaPlayer.EventListener { event ->
       when (event.type) {
@@ -621,6 +625,7 @@ class VlcPlayerView @JvmOverloads constructor(
 
     private fun handlePlaying() {
       requestAudioFocusIfNeeded()
+      attemptPositionRestore()
       if (isBufferingState) {
         isBufferingState = false
         emitBuffer(isBuffering = false, percent = 100f)
@@ -646,6 +651,7 @@ class VlcPlayerView @JvmOverloads constructor(
       // libvlc 3.x leaves the player terminated after EndReached — seek-to-0
       // + play() doesn't work, only a full prepare() restarts cleanly.
       if (desiredRepeat && uri != null && attachedToWindow && !released) {
+        lastTimeMs = 0 // the loop restart must begin at zero, not near the end
         ensureSession().prepare(uri, desiredMediaOptions, autoPlay = true)
       }
     }
@@ -656,6 +662,7 @@ class VlcPlayerView @JvmOverloads constructor(
     }
 
     private fun handleTimeChanged(time: Long) {
+      lastTimeMs = time.coerceAtLeast(0L)
       if (cachedLengthMs <= 0L) return  // live stream — no meaningful progress
       val safeTime = time.coerceAtLeast(0L)
       val percent = (safeTime.toFloat() / cachedLengthMs * 100f).coerceIn(0f, 100f)
@@ -664,7 +671,19 @@ class VlcPlayerView @JvmOverloads constructor(
 
     private fun handleLengthChanged(lengthMs: Long) {
       cachedLengthMs = lengthMs.coerceAtLeast(0L)
+      // Playing often arrives before the duration does; retry the restore.
+      attemptPositionRestore()
       maybeEmitLoad()
+    }
+
+    // VOD only (live has no position). Waits until BOTH playing and duration
+    // are known — consuming the pending value early restarts at zero.
+    private fun attemptPositionRestore() {
+      if (pendingRestoreMs <= 0L || cachedLengthMs <= 0L) return
+      if (!isPlaying()) return
+      val restoreMs = pendingRestoreMs
+      pendingRestoreMs = 0
+      if (restoreMs < cachedLengthMs) seekTo(restoreMs)
     }
 
     private fun maybeEmitLoad() {
@@ -684,6 +703,10 @@ class VlcPlayerView @JvmOverloads constructor(
 
     fun prepare(uri: Uri, mediaOptions: List<String>, autoPlay: Boolean) {
       Log.i(TAG, "Loading media ${redactUri(uri)} with mediaOptions [${mediaOptions.joinToString(", ")}]")
+      // Same-URI reload continues at the previous position; a new source
+      // starts clean at zero.
+      pendingRestoreMs = if (uri == loadedUri && lastTimeMs > 1500) lastTimeMs else 0
+      if (pendingRestoreMs == 0L) lastTimeMs = 0
       loadedUri = uri
       playWhenAttached = autoPlay
       hasEmittedLoad = false

@@ -1375,15 +1375,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
         }
         strongSelf->_appliedPaused = NO;
         strongSelf->_mediaEverPlayed = YES;
-        // Restore the pre-disruption position (VOD only — live has none).
-        if (strongSelf->_pendingRestoreTimeMs > 0) {
-          int64_t restoreMs = strongSelf->_pendingRestoreTimeMs;
-          strongSelf->_pendingRestoreTimeMs = 0;
-          if (strongSelf->_loadedDurationMs > 0 && restoreMs < strongSelf->_loadedDurationMs) {
-            NSLog(@"[VlcPlayer] restoring position to %lldms", restoreMs);
-            strongSelf->_mediaPlayer.time = [VLCTime timeWithInt:(int)restoreMs];
-          }
-        }
+        [strongSelf attemptPositionRestore];
         [strongSelf cancelOpeningTimeout];
         [strongSelf cancelResumeFallback];
 
@@ -1455,6 +1447,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
   [self emitEndForURL:url];
   if (_desiredRepeat && url != nil) {
+    _lastTimeMs = 0; // the loop restart must begin at zero, not near the end
     _loadedURL = nil;
     [self syncPlayer];
   }
@@ -1481,6 +1474,22 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 {
   if (_destroyed) return;
   _loadedDurationMs = lengthMs > 0 ? lengthMs : 0;
+  // Playing often arrives before the duration does; retry the restore here.
+  [self attemptPositionRestore];
+}
+
+// Restore the pre-reload position (VOD only — live has no position). Keeps
+// the pending value until BOTH playing and duration are known; consuming it
+// early was why repeat-toggle reloads restarted from zero.
+- (void)attemptPositionRestore
+{
+  if (_pendingRestoreTimeMs <= 0 || _loadedDurationMs <= 0) return;
+  if (!_mediaPlayer.isPlaying) return;
+  int64_t restoreMs = _pendingRestoreTimeMs;
+  _pendingRestoreTimeMs = 0;
+  if (restoreMs < _loadedDurationMs) {
+    _mediaPlayer.time = [VLCTime timeWithInt:(int)restoreMs];
+  }
 }
 
 #pragma mark - Fabric registration
