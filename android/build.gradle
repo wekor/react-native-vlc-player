@@ -64,6 +64,6 @@ android {
 
 dependencies {
   implementation "com.facebook.react:react-android"
-  implementation "org.videolan.android:libvlc-all:3.7.0"
+  implementation "org.videolan.android:libvlc-all:3.7.4"
   implementation "androidx.lifecycle:lifecycle-process:2.7.0"
 }
