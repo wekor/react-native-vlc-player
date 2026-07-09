@@ -609,6 +609,13 @@ class VlcPlayerView @JvmOverloads constructor(
 
     init {
       mediaPlayer.setEventListener(eventListener)
+      // libvlc's scale math assumes a fullscreen surface: it swaps width and
+      // height whenever the surface orientation mismatches the DEVICE
+      // orientation (VideoHelper.updateVideoSurfaces), which wrecks every
+      // scale type for an embedded landscape view inside a portrait app —
+      // cover/stretch showed huge black bars. This opt-in derives orientation
+      // from the actual surface bounds instead.
+      mediaPlayer.setUseOrientationFromBounds(true)
     }
 
     // ---- libvlc event handlers ----
