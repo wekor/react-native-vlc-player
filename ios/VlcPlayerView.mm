@@ -4,46 +4,6 @@
 #import <React/RCTAssert.h>
 #import <React/RCTLog.h>
 #import <VLCKit/VLCKit.h>
-#import <objc/runtime.h>
-
-// VLCKit's modulemap excludes <vlc/libvlc*.h>, so forward-declare what we use.
-#if defined(__cplusplus)
-extern "C" {
-#endif
-
-typedef struct libvlc_media_player_t  libvlc_media_player_t;
-typedef struct libvlc_event_manager_t libvlc_event_manager_t;
-
-typedef int64_t libvlc_time_t;
-
-typedef struct libvlc_event_t {
-    int   type;
-    void *p_obj;
-    union {
-        struct { float new_cache; } media_player_buffering;
-        struct { libvlc_time_t new_time; } media_player_time_changed;
-        struct { libvlc_time_t new_length; } media_player_length_changed;
-    } u;
-} libvlc_event_t;
-
-typedef void (*libvlc_callback_t)(const libvlc_event_t *, void *);
-
-enum {
-    libvlc_MediaPlayerBuffering     = 0x103,
-    libvlc_MediaPlayerStopping      = 0x109,
-    libvlc_MediaPlayerTimeChanged   = 0x10b,
-    libvlc_MediaPlayerLengthChanged = 0x111,
-};
-
-extern libvlc_event_manager_t *libvlc_media_player_event_manager(libvlc_media_player_t *p_mi);
-extern int  libvlc_event_attach(libvlc_event_manager_t *p_event_manager, int i_event_type,
-                                libvlc_callback_t f_callback, void *user_data);
-extern void libvlc_event_detach(libvlc_event_manager_t *p_event_manager, int i_event_type,
-                                libvlc_callback_t f_callback, void *user_data);
-
-#if defined(__cplusplus)
-}
-#endif
 
 static inline int VLCClampInt32(int64_t value)
 {
@@ -171,6 +131,30 @@ static inline void VLCRunOnMain(dispatch_block_t block)
   }
 }
 
+// ROOT CAUSE of "audio but no video after backgrounding": the a20 vout
+// renders through an AVSampleBufferDisplayLayer, which iOS moves to Failed
+// when the app backgrounds — and upstream never flushes it (verified in
+// vlc@fe6e76a9 VLCSampleBufferDisplay.m: enqueueSampleBuffer with zero status
+// handling), so every frame after foregrounding is silently dropped. The
+// layer lives inside OUR view tree (VLCSampleBufferDisplayView's layerClass),
+// so we flush it ourselves on foreground; flush resets Failed → rendering
+// resumes. Public AVFoundation API on our own hierarchy.
+static void VLCFlushFailedSampleBufferLayers(UIView *root)
+{
+  if ([root.layer isKindOfClass:[AVSampleBufferDisplayLayer class]]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)root.layer;
+    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+      [layer flush];
+    }
+#pragma clang diagnostic pop
+  }
+  for (UIView *subview in root.subviews) {
+    VLCFlushFailedSampleBufferLayers(subview);
+  }
+}
+
 // Ports VLC-iOS treats as "external audio playback device" — wired
 // headphones and any Bluetooth/USB audio sink.
 static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route)
@@ -186,81 +170,6 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     }
   }
   return NO;
-}
-
-// Reach into VLCMediaPlayer's private `_playerInstance` ivar — VLCKit's
-// wrapper drops libvlc's cache values, so we hook libvlc directly.
-static libvlc_media_player_t *VLCRawMediaPlayer(VLCMediaPlayer *player)
-{
-  if (player == nil) return NULL;
-  static Ivar ivar;
-  static dispatch_once_t onceToken;
-  dispatch_once(&onceToken, ^{
-    ivar = class_getInstanceVariable([VLCMediaPlayer class], "_playerInstance");
-  });
-  if (ivar == NULL) return NULL;
-  ptrdiff_t offset = ivar_getOffset(ivar);
-  void *base = (__bridge void *)player;
-  return *(libvlc_media_player_t **)((char *)base + offset);
-}
-
-@class VlcPlayerView;
-@interface VlcPlayerView (VLCEventHandler)
-- (void)handleLibVLCBufferingPercent:(float)percent;
-- (void)handleLibVLCTimeChanged:(int64_t)timeMs;
-- (void)handleLibVLCLengthChanged:(int64_t)lengthMs;
-- (void)handleLibVLCStopping;
-@end
-
-// Weak-holder handed to libvlc as event userData. The callback must not form
-// a fresh __weak reference to the view — if the view is mid-dealloc on
-// another thread, objc_initWeak on it is undefined behavior. Loading an
-// already-stored weak var is safe, so the bridge owns the weak ref. The view
-// retains the bridge for exactly the attach→detach window.
-@interface VlcEventBridge : NSObject
-@property (atomic, weak) VlcPlayerView *view;
-@end
-@implementation VlcEventBridge
-@end
-
-// libvlc event thread. Extract data sync (event struct is stack-allocated),
-// then hop to main; the bridge resolves the view (or nil) at execution time.
-static void VLCEventCallback(const libvlc_event_t *event, void *userData)
-{
-  if (event == NULL) return;
-  VlcEventBridge *bridge = (__bridge VlcEventBridge *)userData;
-
-  switch (event->type) {
-    case libvlc_MediaPlayerBuffering: {
-      float cache = event->u.media_player_buffering.new_cache;
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [bridge.view handleLibVLCBufferingPercent:cache];
-      });
-      break;
-    }
-    case libvlc_MediaPlayerTimeChanged: {
-      int64_t timeMs = (int64_t)event->u.media_player_time_changed.new_time;
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [bridge.view handleLibVLCTimeChanged:timeMs];
-      });
-      break;
-    }
-    case libvlc_MediaPlayerLengthChanged: {
-      int64_t lengthMs = (int64_t)event->u.media_player_length_changed.new_length;
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [bridge.view handleLibVLCLengthChanged:lengthMs];
-      });
-      break;
-    }
-    case libvlc_MediaPlayerStopping: {
-      dispatch_async(dispatch_get_main_queue(), ^{
-        [bridge.view handleLibVLCStopping];
-      });
-      break;
-    }
-    default:
-      break;
-  }
 }
 
 // NSObject<VLCDrawable> forwarder, mirroring VLC for iOS's PlaybackService
@@ -286,7 +195,7 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 }
 @end
 
-@interface VlcPlayerView () <RCTVlcPlayerViewViewProtocol>
+@interface VlcPlayerView () <RCTVlcPlayerViewViewProtocol, VLCMediaPlayerDelegate>
 @end
 
 @implementation VlcPlayerView {
@@ -296,7 +205,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
   VLCMediaPlayer *_mediaPlayer;
   NSArray<NSString *> *_playerInitOptions;
-  VlcEventBridge *_eventBridge;  // alive for exactly the libvlc attach→detach window
 
   // Desired (props)
   NSURL *_desiredURL;
@@ -336,7 +244,6 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   BOOL _hasEmittedLoad;
   BOOL _hasEmittedEnd;
   BOOL _isBufferingState;
-  BOOL _userInitiatedStop;  // set before our [stop]; consumed by Stopping handler
   // While an audio interruption is in flight, recovery belongs to the
   // interruption handler alone — didBecomeActive must not arm its
   // reload-fallback, whose media reload showed up as "connecting AirPods
@@ -620,25 +527,32 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     return;
   }
 
-  if (_mediaPlayer != nil && ![_playerInitOptions isEqualToArray:_desiredInitOptions]) {
-    [self releasePlayer];
+  // One player per media: a20 crashes when media is hot-swapped on a live
+  // player (vlc_mutex_trylock on a destroyed lock — upstream's own examples
+  // never exercise that path), so ANY media-defining change retires the whole
+  // player and starts a fresh one. releasePlayer drains the old one safely.
+  if (_mediaPlayer != nil) {
+    BOOL needsMedia =
+        _loadedURL == nil ||
+        ![_loadedURL isEqual:_desiredURL] ||
+        ![_loadedMediaOptions isEqualToArray:_desiredMediaOptions] ||
+        _loadedHardwareEnabled != _desiredHardwareEnabled ||
+        _loadedRepeat != _desiredRepeat ||
+        !VLCEqualStrings(_loadedReferer, _desiredReferer) ||
+        !VLCEqualStrings(_loadedUserAgent, _desiredUserAgent) ||
+        ![_playerInitOptions isEqualToArray:_desiredInitOptions];
+    if (needsMedia) {
+      [self releasePlayer];
+    }
   }
 
-  if (_mediaPlayer == nil && ![self createPlayer]) {
-    return;
-  }
-
-  BOOL needsMedia =
-      _loadedURL == nil ||
-      ![_loadedURL isEqual:_desiredURL] ||
-      ![_loadedMediaOptions isEqualToArray:_desiredMediaOptions] ||
-      _loadedHardwareEnabled != _desiredHardwareEnabled ||
-      _loadedRepeat != _desiredRepeat ||
-      !VLCEqualStrings(_loadedReferer, _desiredReferer) ||
-      !VLCEqualStrings(_loadedUserAgent, _desiredUserAgent);
-
-  if (needsMedia && ![self loadDesiredMedia]) {
-    return;
+  if (_mediaPlayer == nil) {
+    if (![self createPlayer]) {
+      return;
+    }
+    if (![self loadDesiredMedia]) {
+      return;
+    }
   }
 
   if (_desiredPaused) {
@@ -654,9 +568,16 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     RCTLogInfo(@"VlcPlayerView: creating VLC player with initOptions [%@]",
                [_desiredInitOptions componentsJoinedByString:@", "]);
 
-    VLCMediaPlayer *player = _desiredInitOptions.count == 0
-        ? [[VLCMediaPlayer alloc] init]
-        : [[VLCMediaPlayer alloc] initWithOptions:_desiredInitOptions];
+    // a20 removed -initWithOptions: from the public surface (it only exists
+    // in a private category; the official DropIn example uses plain -init).
+    // Instance-level options go through a dedicated VLCLibrary instead.
+    VLCMediaPlayer *player;
+    if (_desiredInitOptions.count == 0) {
+      player = [[VLCMediaPlayer alloc] init];
+    } else {
+      VLCLibrary *library = [[VLCLibrary alloc] initWithOptions:_desiredInitOptions];
+      player = library == nil ? nil : [[VLCMediaPlayer alloc] initWithLibrary:library];
+    }
 
     if (player == nil) {
       [self emitError:@"Failed to create VLC player: VLCKit returned nil" shouldStopPlayback:YES];
@@ -666,28 +587,10 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     // Set drawable ONCE — never reassign during the player's lifetime.
     player.drawable = _drawable;
 
-    // Per-player observer (not class-wide) — keeps stale notifications from a
-    // previously-released player out. We avoid TimeChangedNotification: it
-    // reads `player.media` and races with media swaps.
-    [NSNotificationCenter.defaultCenter addObserver:self
-                                           selector:@selector(handleStateChanged:)
-                                               name:VLCMediaPlayerStateChangedNotification
-                                             object:player];
-
-    libvlc_media_player_t *rawPlayer = VLCRawMediaPlayer(player);
-    if (rawPlayer != NULL) {
-      VlcEventBridge *bridge = [VlcEventBridge new];
-      bridge.view = self;
-      _eventBridge = bridge;
-      libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
-      void *userData = (__bridge void *)bridge;
-      libvlc_event_attach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
-      libvlc_event_attach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
-      libvlc_event_attach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
-      libvlc_event_attach(em, libvlc_MediaPlayerStopping,      VLCEventCallback, userData);
-    } else {
-      RCTLogWarn(@"VlcPlayerView: VLCMediaPlayer._playerInstance unavailable — buffering/progress/end-of-stream signals degraded");
-    }
+    // a20 exposes everything we need through the official delegate (buffering
+    // percent included) — the a19-era private-ivar hook and raw libvlc event
+    // bridge are gone. Delegate callbacks arrive on the main thread.
+    player.delegate = self;
 
     _mediaPlayer = player;
     _playerInitOptions = [_desiredInitOptions copy];
@@ -719,21 +622,8 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   _loadedDurationMs = 0;
 
   @try {
-    if (player.media != nil) {
-      // Only flag the stop if it will actually fire Stopping; otherwise the
-      // flag never gets consumed and suppresses a later natural end.
-      VLCMediaPlayerState s = player.state;
-      if (s == VLCMediaPlayerStateOpening ||
-          s == VLCMediaPlayerStateBuffering ||
-          s == VLCMediaPlayerStatePlaying ||
-          s == VLCMediaPlayerStatePaused) {
-        _userInitiatedStop = YES;
-      }
-      // pause-before-stop avoids the libvlc_media_retain race during RTSP teardown.
-      [player pause];
-      [player stop];
-    }
-
+    // The player is always freshly created for this media (see syncPlayer) —
+    // a20 crashes when media is hot-swapped on a live player, so we never do.
     VLCMedia *media = [VLCMedia mediaWithURL:url];
     if (media == nil) {
       [self emitError:@"Failed to create VLC media" shouldStopPlayback:YES];
@@ -879,32 +769,25 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     return;
   }
 
-  [NSNotificationCenter.defaultCenter removeObserver:self
-                                                name:VLCMediaPlayerStateChangedNotification
-                                              object:player];
-
-  // libvlc_event_detach is sync — blocks until in-flight handlers complete.
-  libvlc_media_player_t *rawPlayer = VLCRawMediaPlayer(player);
-  if (rawPlayer != NULL && _eventBridge != nil) {
-    libvlc_event_manager_t *em = libvlc_media_player_event_manager(rawPlayer);
-    void *userData = (__bridge void *)_eventBridge;
-    libvlc_event_detach(em, libvlc_MediaPlayerBuffering,     VLCEventCallback, userData);
-    libvlc_event_detach(em, libvlc_MediaPlayerTimeChanged,   VLCEventCallback, userData);
-    libvlc_event_detach(em, libvlc_MediaPlayerLengthChanged, VLCEventCallback, userData);
-    libvlc_event_detach(em, libvlc_MediaPlayerStopping,      VLCEventCallback, userData);
-  }
-  _eventBridge = nil;
+  player.delegate = nil;
 
   @try {
-    // pause→drawable→stop avoids a libvlc_media_retain race during RTSP teardown.
-    // Don't `player.media = nil` here: VLCKit 4 stop is async and clearing
-    // media while events are still draining asserts on a NULL retain.
-    [player pause];
+    // a20's pause is async on a background queue — the a19 pause-before-stop
+    // dance is gone. Don't `player.media = nil` here: stop is async and
+    // clearing media while events drain asserts on a NULL retain.
     player.drawable = nil;
     [player stop];
   } @catch (NSException *exception) {
     RCTLogWarn(@"VlcPlayerView: failed to release VLC player cleanly: %@", VLCExceptionReason(exception));
   }
+
+  // The a20 hot-swap crash (vlc_mutex_trylock on a destroyed lock) hit when
+  // the player was released while its async stop was still draining. Keep the
+  // doomed player alive until the teardown has safely finished.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                 dispatch_get_main_queue(), ^{
+                   (void)player;
+                 });
 }
 
 - (void)invalidatePendingPlayback
@@ -1143,16 +1026,26 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     _backgroundDate = nil;
     return;
   }
-  // Audio interruption in flight (AirPods connect, call UI): recovery is the
-  // interruption handler's job; the reload-fallback below must stay out.
+  // Audio interruption in flight while the app stayed active (AirPods
+  // connect, call UI): recovery is the interruption handler's job. But a
+  // genuine background return outranks the flag — iOS doesn't guarantee an
+  // interruption-Ended, and a wedged flag here was exactly the "black screen
+  // after app switch" regression (worked in 0.2.0, broken by this flag).
   if (_audioInterruptionActive) {
-    NSLog(@"[VlcPlayer] didBecomeActive ignored — audio interruption active");
-    return;
+    if (_backgroundDate == nil) {
+      NSLog(@"[VlcPlayer] didBecomeActive ignored — audio interruption active");
+      return;
+    }
+    _audioInterruptionActive = NO;
   }
 
   NSTimeInterval timeAway = _backgroundDate == nil ? 0 : [[NSDate date] timeIntervalSinceDate:_backgroundDate];
   NSLog(@"[VlcPlayer] didBecomeActive (timeAway=%.1fs)", timeAway);
   _backgroundDate = nil;
+
+  // Revive the vout's sample-buffer layer if backgrounding failed it — must
+  // happen before resuming, or video stays black while audio plays.
+  VLCFlushFailedSampleBufferLayers(_videoOutputView);
 
   if (_mediaPlayer == nil || timeAway > kVLCBackgroundResumeThreshold) {
     _loadedURL = nil;
@@ -1186,6 +1079,12 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
     if (strongSelf == nil || strongSelf->_destroyed) return;
 
     if (type == AVAudioSessionInterruptionTypeBegan) {
+      // Already backgrounded (the interruption can be delivered AFTER
+      // DidEnterBackground): the background handler owns this pause; setting
+      // the flag here would wedge it — nothing clears it until foreground.
+      if (strongSelf->_backgroundDate != nil) {
+        return;
+      }
       NSLog(@"[VlcPlayer] audio interruption began (playing=%d)", strongSelf->_mediaPlayer.isPlaying);
       strongSelf->_audioInterruptionActive = YES;
       if (strongSelf->_mediaPlayer.isPlaying) {
@@ -1352,21 +1251,23 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
 
 #pragma mark - VLCKit notifications
 
-- (void)handleStateChanged:(NSNotification *)notification
+// VLCMediaPlayerDelegate — callbacks arrive on libvlc's event thread (see the
+// note on mediaPlayerBufferingChanged:), hence the VLCRunOnMain hop. The
+// delegate is per-player and nil'ed before release, so no stale-event checks
+// beyond _destroyed are needed.
+- (void)mediaPlayerStateChanged:(VLCMediaPlayerState)newState
 {
-  VLCMediaPlayer *eventPlayer = notification.object;
-  if (![eventPlayer isKindOfClass:[VLCMediaPlayer class]]) return;
-  VLCMediaPlayerState newState = eventPlayer.state;
-
   __weak __typeof(self) weakSelf = self;
   VLCRunOnMain(^{
     __strong __typeof(weakSelf) strongSelf = weakSelf;
     if (strongSelf == nil || strongSelf->_destroyed) return;
-    if (strongSelf->_mediaPlayer != eventPlayer) return;  // stale
 
     switch (newState) {
-      case VLCMediaPlayerStateBuffering:
-        // Buffering signal comes from VLCEventCallback (real cache percent).
+      // a20's enum is exactly: Stopped/Stopping/Opening/Playing/Paused/Error
+      // (verified against VLCMediaPlayer-a20.m's state-name table). Buffering
+      // is no longer a state — it arrives via mediaPlayerBufferingChanged:.
+      case VLCMediaPlayerStateStopping:
+        [strongSelf handleLibVLCStopping];
         break;
 
       case VLCMediaPlayerStatePlaying: {
@@ -1407,6 +1308,41 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   });
 }
 
+// a20 reports buffering as [0,1]; internal handlers keep the 0–100 scale.
+// VLCRunOnMain is REQUIRED, not defensive: VLCKit 4's default events
+// configuration has no dispatch queue, so delegate callbacks run inline on
+// libvlc's event thread (VLCLibrary.m +load → VLCEventsDefaultConfiguration
+// → VLCEventsHandler executes the block in place).
+- (void)mediaPlayerBufferingChanged:(float)buffering
+{
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed) return;
+    [strongSelf handleLibVLCBufferingPercent:buffering * 100.0f];
+  });
+}
+
+- (void)mediaPlayerTimeChanged:(NSNotification *)notification
+{
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed || strongSelf->_mediaPlayer == nil) return;
+    [strongSelf handleLibVLCTimeChanged:(int64_t)strongSelf->_mediaPlayer.time.value.longLongValue];
+  });
+}
+
+- (void)mediaPlayerLengthChanged:(int64_t)length
+{
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed) return;
+    [strongSelf handleLibVLCLengthChanged:length];
+  });
+}
+
 // percent <100: in-progress; ≥100: complete. Mirrors Android handleBuffering.
 - (void)handleLibVLCBufferingPercent:(float)percent
 {
@@ -1424,15 +1360,11 @@ static void VLCEventCallback(const libvlc_event_t *event, void *userData)
   }
 }
 
-// libvlc fires Stopping for both natural end and user-initiated stop;
-// _userInitiatedStop is how we tell them apart.
+// Natural end of stream. Our own teardown stops can't reach here: the
+// delegate is nil'ed before releasePlayer issues its stop.
 - (void)handleLibVLCStopping
 {
   if (_destroyed) return;
-  if (_userInitiatedStop) {
-    _userInitiatedStop = NO;
-    return;
-  }
   if (_mediaPlayer == nil) return;
   if (_mediaPlayer.state == VLCMediaPlayerStateError) return;
   if (_hasEmittedEnd) return;

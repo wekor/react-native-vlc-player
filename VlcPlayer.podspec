@@ -15,7 +15,7 @@ Pod::Spec.new do |s|
 
   s.source_files = "ios/**/*.{h,m,mm,swift,cpp}"
   s.private_header_files = "ios/**/*.h"
-  s.dependency "VLCKit", "4.0.0a19"
+  s.dependency "VLCKit", "4.0.0a20"
 
   install_modules_dependencies(s)
 end
