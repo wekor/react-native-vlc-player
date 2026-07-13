@@ -38,6 +38,34 @@ type ErrorEvent = Readonly<{
   message: string;
 }>;
 
+// Ground truth of whether media is actually playing. Fires on every
+// transition, including native-initiated pauses (phone call, headphones
+// unplugged) that the `paused` prop cannot know about.
+type PlaybackStateEvent = Readonly<{
+  isPlaying: boolean;
+}>;
+
+// One playable track (audio or text). `id` is an opaque native identifier:
+// libvlc string ids on iOS, stringified ints on Android — JS must treat it
+// as a token that round-trips into the track-selection props.
+// `language` is a BCP-47-ish code when the container declares one; iOS
+// reports it from VLCMediaTrack.language, Android's TrackDescription has no
+// language field so it is always '' there (the name usually carries it).
+type TracksChangedEvent = Readonly<{
+  audioTracks: {
+    id: string;
+    name: string;
+    language: string;
+    selected: boolean;
+  }[];
+  textTracks: {
+    id: string;
+    name: string;
+    language: string;
+    selected: boolean;
+  }[];
+}>;
+
 // Internal: snapshot() Promise resolution.
 // JS issues a snapshot command with a callId and the native side replies via
 // this event. The JS wrapper holds a callId→Promise registry and never
@@ -65,6 +93,19 @@ interface NativeProps extends ViewProps {
   hardwareDecoding?: CodegenTypes.WithDefault<boolean, true>;
   initOptions?: ReadonlyArray<string>;
   mediaOptions?: ReadonlyArray<string>;
+  // Track selection. 'auto' = libvlc's default choice, 'none' = disabled,
+  // otherwise a track id from onTracksChanged. Declarative so the choice
+  // survives media reloads (repeat/hardwareDecoding toggles, recovery).
+  // Language preference doesn't need this — use mediaOptions
+  // ':audio-language=' / ':sub-language=' instead.
+  audioTrack?: CodegenTypes.WithDefault<string, 'auto'>;
+  textTrack?: CodegenTypes.WithDefault<string, 'auto'>;
+  // External subtitle file (file:// or http(s)://), loaded with the media
+  // and auto-selected.
+  subtitleUri?: string;
+  // Minimum milliseconds between onProgress emissions (native-side throttle;
+  // matters for multi-player grids where every event crosses the bridge).
+  progressUpdateInterval?: CodegenTypes.WithDefault<CodegenTypes.Int32, 500>;
 
   onLoad?: CodegenTypes.DirectEventHandler<LoadEvent>;
   onPlaying?: CodegenTypes.DirectEventHandler<PlayingEvent>;
@@ -72,6 +113,8 @@ interface NativeProps extends ViewProps {
   onProgress?: CodegenTypes.DirectEventHandler<ProgressEvent>;
   onEnd?: CodegenTypes.DirectEventHandler<EndEvent>;
   onError?: CodegenTypes.DirectEventHandler<ErrorEvent>;
+  onPlaybackStateChanged?: CodegenTypes.DirectEventHandler<PlaybackStateEvent>;
+  onTracksChanged?: CodegenTypes.DirectEventHandler<TracksChangedEvent>;
   onSnapshotResult?: CodegenTypes.DirectEventHandler<SnapshotResultEvent>;
 }
 

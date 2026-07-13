@@ -1,72 +1,97 @@
 import type { ViewProps } from 'react-native';
 
-/** 视频缩放方式 */
+/** How the video is scaled inside the view. */
 export type VlcPlayerResizeMode = 'contain' | 'cover' | 'stretch' | 'original';
 
 /**
- * 视频源 / Video source.
- *
- * 字符串形式等价于 `{ uri: ... }`。对象形式允许额外配置 HTTP 请求头——
- * 注意 libvlc **只支持 `Referer` 和 `User-Agent` 两个头**，其他自定义
- * header（如 `Authorization`）受 libvlc 网络栈限制无法注入；如需 Bearer
- * token 鉴权，请把 token 放进 URL 查询参数或用 HTTP Basic Auth。
+ * Video source.
  *
  * String form is equivalent to `{ uri: ... }`. Object form allows extra
- * HTTP request configuration — but libvlc **only supports `Referer` and
- * `User-Agent` headers**, arbitrary headers (e.g. `Authorization`) cannot
- * be injected due to libvlc network stack constraints.
+ * HTTP request configuration — but libvlc **only supports the `Referer`
+ * and `User-Agent` headers**; arbitrary headers (e.g. `Authorization`)
+ * cannot be injected due to libvlc network stack constraints. For
+ * bearer-token auth, put the token in the URL query string or use HTTP
+ * Basic Auth.
  */
 export type VideoSource =
   | string
   | {
-      /** 视频/流地址。RTSP / RTMP / HTTP(S) / HLS / file:// 都支持。 */
+      /** Stream/file URL. RTSP / RTMP / HTTP(S) / HLS / file:// all work. */
       uri: string;
       /**
-       * HTTP `Referer` 头。常用于绕开防盗链（B 站、CDN 防盗链等都查 Referer）。
-       * 仅对 HTTP/HTTPS 流有效。
+       * HTTP `Referer` header — commonly needed for anti-hotlinking CDNs.
+       * HTTP/HTTPS streams only.
        */
       referer?: string;
       /**
-       * HTTP `User-Agent` 头。某些服务器对默认 libvlc UA 有限制时使用。
-       * 仅对 HTTP/HTTPS 流有效。
+       * HTTP `User-Agent` header, for servers that reject libvlc's default.
+       * HTTP/HTTPS streams only.
        */
       userAgent?: string;
     };
 
-/** `onLoad` 事件 payload —— 元数据解析完成 */
+/** `onLoad` payload — media metadata is known. */
 export type VlcPlayerLoadPayload = {
-  /** 视频总时长，毫秒。直播流为 0。 */
+  /** Total duration in milliseconds. 0 for live streams. */
   duration: number;
-  /** 视频原始分辨率。 */
-  videoSize: { width: number; height: number };
+  /** Native video width in pixels. */
+  videoWidth: number;
+  /** Native video height in pixels. */
+  videoHeight: number;
 };
 
-/** `onBuffer` 事件 payload —— 缓冲状态变化 */
+/** `onBuffer` payload — buffering state changed. */
 export type VlcPlayerBufferPayload = {
-  /** 当前是否在缓冲。`true` 时显示 loading 动画，`false` 时隐藏。 */
+  /** True while buffering — show a loading indicator. */
   isBuffering: boolean;
-  /** 缓冲进度，0..100。 */
+  /** Buffer fill, 0..100. */
   percent: number;
 };
 
-/** `onProgress` 事件 payload —— 播放进度（仅点播） */
+/** `onProgress` payload — playback position. */
 export type VlcPlayerProgressPayload = {
-  /** 已播放时长，毫秒。 */
+  /** Elapsed playback time in milliseconds. */
   currentTime: number;
-  /** 视频总时长，毫秒。 */
+  /** Total duration in milliseconds. 0 for live streams. */
   duration: number;
-  /** 播放进度，0..100。 */
+  /** Playback progress, 0..100. 0 for live streams. */
   percent: number;
 };
 
-/** `onError` 事件 payload */
+/** `onError` payload. */
 export type VlcPlayerErrorPayload = {
   message: string;
 };
 
+/**
+ * One selectable track (audio or text). `id` is an opaque native
+ * identifier — round-trip it into the `audioTrack` / `textTrack` prop
+ * as-is, never parse it (libvlc string ids on iOS, stringified ints on
+ * Android).
+ */
+export type VlcPlayerTrack = {
+  id: string;
+  name: string;
+  /**
+   * Language code when the container declares one. iOS reports it from
+   * VLC metadata; Android always reports '' (the name usually carries
+   * the language).
+   */
+  language: string;
+  /** Whether this track is currently selected for playback. */
+  selected: boolean;
+};
+
+/** `onTracksChanged` payload — the available track lists changed. */
+export type VlcPlayerTracksPayload = {
+  audioTracks: readonly VlcPlayerTrack[];
+  textTracks: readonly VlcPlayerTrack[];
+};
+
 export type VlcPlayerViewProps = ViewProps & {
   /**
-   * 视频源。字符串或对象形式（对象支持 `referer` / `userAgent`）。
+   * Video source, as a string or an object (the object form supports
+   * `referer` / `userAgent`).
    *
    * @example
    * source="https://example.com/stream.m3u8"
@@ -76,95 +101,146 @@ export type VlcPlayerViewProps = ViewProps & {
   source?: VideoSource;
 
   /**
-   * 暂停。受控属性。@default false
+   * Pause playback. Controlled prop. @default false
    *
-   * 注意：来电中断、拔耳机/蓝牙断开等系统事件会让原生侧按平台惯例自动暂停，
-   * 此时该 prop 不会被改写（详见 README 的 Events 注意事项）。
+   * Note: system events (phone-call interruptions, headphone/Bluetooth
+   * disconnects) make the native side pause automatically per platform
+   * convention — this prop is NOT mutated when that happens. Listen to
+   * `onPlaybackStateChanged` for the ground truth.
    */
   paused?: boolean;
-  /** 静音。@default false */
+  /** Mute audio. @default false */
   muted?: boolean;
-  /** 音量，0..1。@default 1 */
+  /** Volume, 0..1. @default 1 */
   volume?: number;
   /**
-   * 播放速率，1 为原速，运行时可变（不会重载媒体）。仅点播可靠；
-   * 直播流及部分协议会忽略该请求（libvlc 层限制）。<=0 按 1 处理。
+   * Playback rate; 1 is normal speed. Changing it does not reload the
+   * media. Reliable for VOD only — live streams and some protocols ignore
+   * the request (libvlc limitation). Values <= 0 are treated as 1.
    * @default 1
    */
   rate?: number;
   /**
-   * 播放完毕循环（仅点播）。播放中开关会重载媒体并从头播放（与
-   * `hardwareDecoding` 同语义）。循环行为有平台差异：Android 走 libvlc
-   * 内部无缝循环、循环期间不触发 onEnd；iOS（VLCKit 4 alpha）每圈之间
-   * 短暂重载并触发一次 onEnd。勿用 onEnd 计圈。
+   * Loop playback (VOD only). Toggling while playing reloads the media
+   * (same semantics as `hardwareDecoding`); playback position is
+   * preserved. Loop behavior differs per platform: Android loops
+   * seamlessly inside libvlc and fires no per-loop events; iOS briefly
+   * reloads between passes and fires `onEnd` once per pass. Don't count
+   * loops via onEnd.
    * @default false
    */
   repeat?: boolean;
 
-  /** 视频在容器内的缩放方式。@default 'contain' */
+  /** How the video is scaled inside the view. @default 'contain' */
   resizeMode?: VlcPlayerResizeMode;
 
   /**
-   * 是否启用硬件解码。出现花屏 / 颜色错乱 / 解码失败时改成 `false` 强制纯软解
-   * 排查。修改此值会重新加载媒体，不能在播放中无缝切换。
+   * Toggle hardware video decoding. Set `false` to force software
+   * decoding when the hardware decoder produces artifacts / wrong colors
+   * / decode failures. Changing this reloads the media.
    *
-   * - iOS 走 VLCKit 4 / VideoToolbox；关闭硬解通过 `:codec=avcodec,all`
-   *   实现（与 VLC-iOS 官方应用一致）。
-   * - Android 走 libvlc-android 的 `setHWDecoderEnabled` 接口。
+   * - iOS (VLCKit 4 / VideoToolbox): disabling injects
+   *   `:codec=avcodec,all`, same as the official VLC-iOS app.
+   * - Android: uses libvlc-android's `setHWDecoderEnabled`.
    *
-   * 控制硬解请使用此 prop，不要直接在 `mediaOptions` 里塞 `:codec=...`
-   * 或 `:no-hw-dec` —— 两个平台底层接口不同，混用会被覆盖。
+   * Use this prop instead of passing `:codec=...` / `:no-hw-dec` in
+   * `mediaOptions` — the platforms use different option strings and this
+   * prop's path would clobber yours.
    *
    * @default true
    */
   hardwareDecoding?: boolean;
 
   /**
-   * libvlc 实例级别选项（`--` 前缀，传给 LibVLC 构造函数）。
-   * 用于配置音频输出模块、verbose 日志等 libvlc 全局设置。
-   * 例：`['--rtsp-tcp']`
-   *
-   * 大多数场景下推荐用 `mediaOptions`，更可靠。
+   * libvlc instance-level options (`--` prefix, passed to the LibVLC
+   * constructor), e.g. `['--rtsp-tcp']`. For audio-output-module-style
+   * global settings. Prefer `mediaOptions` for most tweaks.
    */
   initOptions?: readonly string[];
 
   /**
-   * libvlc media 级别选项（`:` 前缀，传给 Media.addOption）。
-   * 用于配置当前媒体的 caching / 网络 / 解码等行为。
-   * 例：`[':network-caching=200']`
-   *
-   * 控制硬解请使用 `hardwareDecoding` prop。
+   * libvlc media-level options (`:` prefix, passed to Media.addOption),
+   * e.g. `[':network-caching=200']`. Caching / network / decoding tweaks
+   * belong here. For hardware decoding use the `hardwareDecoding` prop.
    */
   mediaOptions?: readonly string[];
 
-  /** 媒体元数据已解析（duration / 视频尺寸已知），还没出画面。 */
+  /**
+   * Audio track selection: `'auto'` (libvlc's default choice), `'none'`
+   * (audio off), or a track id from `onTracksChanged`. Declarative — the
+   * choice survives media reloads (repeat/hardwareDecoding toggles,
+   * recovery). For a language preference you don't need this prop: use
+   * `mediaOptions` `':audio-language=zh'` instead.
+   * @default 'auto'
+   */
+  audioTrack?: string;
+  /**
+   * Subtitle track selection: `'auto'`, `'none'` (subtitles off), or a
+   * track id from `onTracksChanged`. For a language preference use
+   * `mediaOptions` `':sub-language=zh'`.
+   * @default 'auto'
+   */
+  textTrack?: string;
+  /**
+   * External subtitle file (`file://` or `http(s)://`, e.g. `.srt`).
+   * Loaded with the media and auto-selected; libvlc renders subtitles
+   * into the video itself.
+   */
+  subtitleUri?: string;
+  /**
+   * Minimum milliseconds between `onProgress` events (throttled on the
+   * native side). Raise it in multi-player grids to cut bridge traffic.
+   * @default 500
+   */
+  progressUpdateInterval?: number;
+
+  /** Metadata known (duration / video size), before the first frame. Once per media. */
   onLoad?: (event: { nativeEvent: VlcPlayerLoadPayload }) => void;
-  /** 第一帧画出，真正开始播放。 */
+  /** First frame rendered — the moment to hide posters/loaders. Once per media. */
   onPlaying?: () => void;
-  /** 缓冲状态变化（启动 + 播放中卡顿）。 */
+  /**
+   * The play/pause ground truth — includes native-initiated pauses
+   * (phone call, headphones unplugged, backgrounding) that never mutate
+   * the `paused` prop. Drive play-button UI state from this.
+   */
+  onPlaybackStateChanged?: (event: {
+    nativeEvent: { isPlaying: boolean };
+  }) => void;
+  /** Buffering state changes (startup + mid-playback stalls). */
   onBuffer?: (event: { nativeEvent: VlcPlayerBufferPayload }) => void;
-  /** 播放进度（每 ~500ms 触发，仅点播）。 */
+  /**
+   * Playback progress. VOD carries duration/percent; live streams report
+   * duration 0 and percent 0 while currentTime keeps counting. Interval
+   * is controlled by `progressUpdateInterval`.
+   */
   onProgress?: (event: { nativeEvent: VlcPlayerProgressPayload }) => void;
-  /** 播放完毕（仅点播）。 */
+  /** Playback finished (VOD only). */
   onEnd?: () => void;
-  /** 出错。 */
+  /** Playback error. */
   onError?: (event: { nativeEvent: VlcPlayerErrorPayload }) => void;
+  /**
+   * Available tracks changed (tracks resolve asynchronously after
+   * playback starts, and on media switches). Build audio/subtitle menus
+   * from this.
+   */
+  onTracksChanged?: (event: { nativeEvent: VlcPlayerTracksPayload }) => void;
 };
 
-/** 通过 ref 拿到的命令式 API。 */
+/** Imperative API, reachable through the ref. */
 export type VlcPlayerHandle = {
-  /** 开始播放。 */
+  /** Start playback. */
   play: () => void;
-  /** 暂停播放。 */
+  /** Pause playback. */
   pause: () => void;
-  /** 跳转到指定秒（仅点播）。 */
+  /** Seek to a position in seconds (VOD only). */
   seek: (seconds: number) => void;
   /**
-   * 截取当前画面，返回 PNG 文件的 `file://` URI，可直接用于
-   * `<Image source={{ uri }}>`。文件写在应用缓存目录，系统可能随时
-   * 清理；需要长期保存请自行拷贝。
+   * Capture the current frame. Resolves to a `file://` URI of a PNG,
+   * directly usable in `<Image source={{ uri }}>`. The file lives in the
+   * app cache directory and may be reclaimed by the OS — copy it out for
+   * persistence.
    */
   snapshot: () => Promise<string>;
-  /** 重新拉流，断流恢复用。 */
+  /** Reconnect the stream — for recovering from a dropped connection. */
   reload: () => void;
 };

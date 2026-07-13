@@ -7,5 +7,7 @@ export type {
   VlcPlayerLoadPayload,
   VlcPlayerProgressPayload,
   VlcPlayerResizeMode,
+  VlcPlayerTrack,
+  VlcPlayerTracksPayload,
   VlcPlayerViewProps,
 } from './VlcPlayerView.types';
