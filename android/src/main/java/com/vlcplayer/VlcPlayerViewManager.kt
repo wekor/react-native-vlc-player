@@ -75,6 +75,22 @@ class VlcPlayerViewManager :
     view.setUserAgent(value)
   }
 
+  override fun setAudioTrack(view: VlcPlayerView, value: String?) {
+    view.setAudioTrackId(value)
+  }
+
+  override fun setTextTrack(view: VlcPlayerView, value: String?) {
+    view.setTextTrackId(value)
+  }
+
+  override fun setSubtitleUri(view: VlcPlayerView, value: String?) {
+    view.setSubtitleUri(value)
+  }
+
+  override fun setProgressUpdateInterval(view: VlcPlayerView, value: Int) {
+    view.setProgressUpdateInterval(value)
+  }
+
   override fun setInitOptions(view: VlcPlayerView, value: ReadableArray?) {
     view.setInitOptions(value.toStringList())
   }

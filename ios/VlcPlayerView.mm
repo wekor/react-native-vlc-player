@@ -219,6 +219,11 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   BOOL _desiredHardwareEnabled;
   NSString *_desiredReferer;     // nil / empty → don't inject :http-referrer=
   NSString *_desiredUserAgent;   // nil / empty → don't inject :http-user-agent=
+  // Track selection: 'auto' (don't touch), 'none' (deselect all), or a
+  // trackId from the tracks event. Desired-tier so it survives reloads.
+  NSString *_desiredAudioTrackId;
+  NSString *_desiredTextTrackId;
+  NSString *_desiredSubtitleUri;  // nil / empty → no external subtitle
 
   // Loaded (in VLC)
   NSURL *_loadedURL;
@@ -227,6 +232,11 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   BOOL _loadedRepeat;
   NSString *_loadedReferer;
   NSString *_loadedUserAgent;
+  NSString *_loadedSubtitleUri;
+  // Media-level slaves load reliably but the core won't re-select subtitles
+  // off a container-default track that was picked first — we nudge once.
+  BOOL _subtitleSlaveSelected;
+  BOOL _tracksEmitScheduled; // coalesces per-track delegate callbacks into one event
 
   // Applied (pushed to player)
   BOOL _appliedPaused;
@@ -242,7 +252,13 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   // retry the failing stream.
   BOOL _haltedByError;
   BOOL _hasEmittedLoad;
+  BOOL _hasEmittedPlaying;
   BOOL _hasEmittedEnd;
+  // Dedupe for onPlaybackStateChanged: -1 unknown, 0 paused, 1 playing.
+  NSInteger _lastReportedIsPlaying;
+  // onProgress throttle (CACurrentMediaTime seconds of last emission).
+  CFTimeInterval _lastProgressEmitTime;
+  int32_t _progressUpdateIntervalMs;
   BOOL _isBufferingState;
   // While an audio interruption is in flight, recovery belongs to the
   // interruption handler alone — didBecomeActive must not arm its
@@ -292,6 +308,9 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     _loadedHardwareEnabled = YES;
     _desiredReferer = nil;
     _desiredUserAgent = nil;
+    _desiredAudioTrackId = @"auto";
+    _desiredTextTrackId = @"auto";
+    _desiredSubtitleUri = nil;
     _loadedReferer = nil;
     _loadedUserAgent = nil;
     _desiredRate = 1.0f;
@@ -371,6 +390,10 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _desiredHardwareEnabled = newProps.hardwareDecoding;
   _desiredReferer = VLCTrimmedString(VLCStringFromStdString(newProps.referer));
   _desiredUserAgent = VLCTrimmedString(VLCStringFromStdString(newProps.userAgent));
+  _desiredAudioTrackId = VLCTrimmedString(VLCStringFromStdString(newProps.audioTrack)) ?: @"auto";
+  _desiredTextTrackId = VLCTrimmedString(VLCStringFromStdString(newProps.textTrack)) ?: @"auto";
+  _desiredSubtitleUri = VLCTrimmedString(VLCStringFromStdString(newProps.subtitleUri));
+  _progressUpdateIntervalMs = newProps.progressUpdateInterval > 0 ? newProps.progressUpdateInterval : 500;
 
   [self syncPlayer];
   [super updateProps:props oldProps:oldProps];
@@ -483,6 +506,9 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _loadedHardwareEnabled = YES;
   _desiredReferer = nil;
   _desiredUserAgent = nil;
+  _desiredAudioTrackId = @"auto";
+  _desiredTextTrackId = @"auto";
+  _desiredSubtitleUri = nil;
   _loadedReferer = nil;
   _loadedUserAgent = nil;
   _desiredRate = 1.0f;
@@ -494,8 +520,12 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _backgroundDate = nil;
   _haltedByError = NO;
   _hasEmittedLoad = NO;
+  _hasEmittedPlaying = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
+  _lastReportedIsPlaying = -1;
+  _lastProgressEmitTime = 0;
+  _progressUpdateIntervalMs = 500;
 }
 
 #pragma mark - Player sync
@@ -515,6 +545,7 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   [self applyDisplayOptions];
   [self applyAudioOptions];
   [self applyPlaybackRate];
+  [self applyTrackSelection];
 
   if (_desiredURL == nil) {
     [self releasePlayer];
@@ -540,6 +571,7 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
         _loadedRepeat != _desiredRepeat ||
         !VLCEqualStrings(_loadedReferer, _desiredReferer) ||
         !VLCEqualStrings(_loadedUserAgent, _desiredUserAgent) ||
+        !VLCEqualStrings(_loadedSubtitleUri, _desiredSubtitleUri) ||
         ![_playerInitOptions isEqualToArray:_desiredInitOptions];
     if (needsMedia) {
       [self releasePlayer];
@@ -575,7 +607,23 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     if (_desiredInitOptions.count == 0) {
       player = [[VLCMediaPlayer alloc] init];
     } else {
-      VLCLibrary *library = [[VLCLibrary alloc] initWithOptions:_desiredInitOptions];
+      // Share one libvlc core per distinct initOptions set: every VLCLibrary
+      // is a full libvlc instance, and per-view instances multiply memory and
+      // startup cost in multi-player grids. The official VLC apps run one
+      // process-wide core; the cache lives for the process, matching that.
+      static NSMutableDictionary<NSString *, VLCLibrary *> *libraryCache;
+      static dispatch_once_t onceToken;
+      dispatch_once(&onceToken, ^{
+        libraryCache = [NSMutableDictionary new];
+      });
+      NSString *cacheKey = [_desiredInitOptions componentsJoinedByString:@"\x1f"];
+      VLCLibrary *library = libraryCache[cacheKey];
+      if (library == nil) {
+        library = [[VLCLibrary alloc] initWithOptions:_desiredInitOptions];
+        if (library != nil) {
+          libraryCache[cacheKey] = library;
+        }
+      }
       player = library == nil ? nil : [[VLCMediaPlayer alloc] initWithLibrary:library];
     }
 
@@ -617,8 +665,11 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _loadedURL = nil;
   _loadedMediaOptions = nil;
   _hasEmittedLoad = NO;
+  _hasEmittedPlaying = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
+  _lastReportedIsPlaying = -1;
+  _lastProgressEmitTime = 0;
   _loadedDurationMs = 0;
 
   @try {
@@ -662,6 +713,21 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     if (_desiredUserAgent.length > 0) {
       [media addOption:[NSString stringWithFormat:@":http-user-agent=%@", _desiredUserAgent]];
     }
+    // External subtitle as a media-level slave — part of the media from the
+    // start, like desktop VLC's "load subtitle file". Priority 4 (user) makes
+    // libvlc auto-select it over any container-default subtitle; no
+    // post-playback enforce dance needed.
+    if (_desiredSubtitleUri.length > 0) {
+      NSURL *slaveURL = [NSURL URLWithString:_desiredSubtitleUri];
+      if (slaveURL == nil || slaveURL.scheme.length == 0) {
+        slaveURL = [NSURL fileURLWithPath:_desiredSubtitleUri];
+      }
+      if (slaveURL != nil) {
+        [media addSlave:[[VLCMediaSlave alloc] initWithURL:slaveURL
+                                                      type:VLCMediaSlaveTypeSubtitle
+                                                  priority:4]];
+      }
+    }
     RCTLogInfo(@"VlcPlayerView: loading media %@ with mediaOptions [%@]",
                VLCRedactedURLString(url),
                [_desiredMediaOptions componentsJoinedByString:@", "]);
@@ -685,6 +751,8 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
     _loadedRepeat = _desiredRepeat;
     _loadedReferer = [_desiredReferer copy];
     _loadedUserAgent = [_desiredUserAgent copy];
+    _loadedSubtitleUri = [_desiredSubtitleUri copy];
+    _subtitleSlaveSelected = NO;
     _appliedPaused = YES;
     // Force a rate re-push for the new media — don't trust libvlc to carry
     // a non-default rate across media changes.
@@ -758,8 +826,10 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _loadedURL = nil;
   _loadedMediaOptions = nil;
   _hasEmittedLoad = NO;
+  _hasEmittedPlaying = NO;
   _hasEmittedEnd = NO;
   _isBufferingState = NO;
+  _lastReportedIsPlaying = -1;
   _loadedDurationMs = 0;
   _appliedPaused = YES;
 
@@ -876,6 +946,70 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   _mediaPlayer.rate = _desiredRate;
   _appliedRate = _desiredRate;
 }
+
+#pragma mark - Tracks
+
+// Reconciles the desired audio/text selection against the player's live
+// track lists. Idempotent (checks isSelected before writing) and re-entered
+// from every point where tracks can appear or change: prop updates, the
+// Playing transition, and the track delegate callbacks — tracks arrive
+// asynchronously, so a desired id is applied whenever its track shows up.
+- (void)applyTrackSelection
+{
+  if (_mediaPlayer == nil) return;
+  [self applySelection:_desiredAudioTrackId
+              toTracks:_mediaPlayer.audioTracks
+         deselectBlock:^(VLCMediaPlayer *player) { [player deselectAllAudioTracks]; }];
+  [self applySelection:_desiredTextTrackId
+              toTracks:_mediaPlayer.textTracks
+         deselectBlock:^(VLCMediaPlayer *player) { [player deselectAllTextTracks]; }];
+
+  // Select the external slave once it appears, while intent is 'auto' — an
+  // explicit choice or 'none' always wins. Slave ids carry a source-hash
+  // prefix, embedded subs are plain "spu/N". Device-verified: without this
+  // the container-default subtitle keeps the selection.
+  if (_loadedSubtitleUri.length > 0 && !_subtitleSlaveSelected &&
+      (_desiredTextTrackId.length == 0 || [_desiredTextTrackId isEqualToString:@"auto"])) {
+    for (VLCMediaPlayerTrack *track in _mediaPlayer.textTracks) {
+      if (![track.trackId hasPrefix:@"spu/"]) {
+        _subtitleSlaveSelected = YES;
+        if (!track.isSelected) {
+          track.selectedExclusively = YES;
+        }
+        break;
+      }
+    }
+  }
+}
+
+- (void)applySelection:(NSString *)desiredId
+              toTracks:(NSArray<VLCMediaPlayerTrack *> *)tracks
+         deselectBlock:(void (^)(VLCMediaPlayer *))deselectBlock
+{
+  if (desiredId.length == 0 || [desiredId isEqualToString:@"auto"]) {
+    return; // don't fight libvlc's default selection
+  }
+  if ([desiredId isEqualToString:@"none"]) {
+    for (VLCMediaPlayerTrack *track in tracks) {
+      if (track.isSelected) {
+        deselectBlock(_mediaPlayer);
+        break;
+      }
+    }
+    return;
+  }
+  for (VLCMediaPlayerTrack *track in tracks) {
+    if ([track.trackId isEqualToString:desiredId]) {
+      if (!track.isSelected) {
+        // Exclusive select: unselects every other track of this kind.
+        track.selectedExclusively = YES;
+      }
+      return;
+    }
+  }
+  // Desired track not in the list (yet) — a later trackAdded callback retries.
+}
+
 
 - (void)applyAudioOptions
 {
@@ -1175,6 +1309,57 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   });
 }
 
+- (void)emitPlaybackStateIsPlaying:(BOOL)isPlaying
+{
+  NSInteger normalized = isPlaying ? 1 : 0;
+  if (_lastReportedIsPlaying == normalized) return;
+  _lastReportedIsPlaying = normalized;
+  auto emitter = [self eventEmitter];
+  if (emitter == nullptr) return;
+  emitter->onPlaybackStateChanged({.isPlaying = static_cast<bool>(isPlaying)});
+}
+
+// Tracks arrive one delegate callback at a time; coalesce into a single
+// event per main-loop turn so JS sees one consistent list, not N partials.
+- (void)scheduleTracksEmit
+{
+  if (_tracksEmitScheduled) return;
+  _tracksEmitScheduled = YES;
+  __weak __typeof(self) weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil) return;
+    strongSelf->_tracksEmitScheduled = NO;
+    [strongSelf emitTracksChangedNow];
+  });
+}
+
+- (void)emitTracksChangedNow
+{
+  if (_destroyed || _mediaPlayer == nil) return;
+  auto emitter = [self eventEmitter];
+  if (emitter == nullptr) return;
+
+  VlcPlayerViewEventEmitter::OnTracksChanged payload{};
+  for (VLCMediaPlayerTrack *track in _mediaPlayer.audioTracks) {
+    payload.audioTracks.push_back({
+        .id = std::string(track.trackId.UTF8String),
+        .name = std::string(track.trackName.UTF8String ?: ""),
+        .language = std::string(track.language.UTF8String ?: ""),
+        .selected = static_cast<bool>(track.isSelected),
+    });
+  }
+  for (VLCMediaPlayerTrack *track in _mediaPlayer.textTracks) {
+    payload.textTracks.push_back({
+        .id = std::string(track.trackId.UTF8String),
+        .name = std::string(track.trackName.UTF8String ?: ""),
+        .language = std::string(track.language.UTF8String ?: ""),
+        .selected = static_cast<bool>(track.isSelected),
+    });
+  }
+  emitter->onTracksChanged(std::move(payload));
+}
+
 - (void)emitBufferIsBuffering:(BOOL)isBuffering percent:(float)percent
 {
   auto emitter = [self eventEmitter];
@@ -1277,12 +1462,18 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
           [strongSelf emitBufferIsBuffering:NO percent:100.0f];
         }
         [strongSelf emitLoadIfReady];
-        [strongSelf emitPlayingForURL:strongSelf->_loadedURL];
+        if (!strongSelf->_hasEmittedPlaying) {
+          strongSelf->_hasEmittedPlaying = YES;
+          [strongSelf emitPlayingForURL:strongSelf->_loadedURL];
+        }
+        [strongSelf emitPlaybackStateIsPlaying:YES];
+        [strongSelf applyTrackSelection];
         break;
       }
 
       case VLCMediaPlayerStatePaused:
       case VLCMediaPlayerStateStopped:
+        [strongSelf emitPlaybackStateIsPlaying:NO];
         if (strongSelf->_isBufferingState) {
           strongSelf->_isBufferingState = NO;
           [strongSelf emitBufferIsBuffering:NO percent:0.0f];
@@ -1334,6 +1525,41 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   });
 }
 
+// Track lifecycle (delegate arrives on libvlc's event thread; hop to main).
+// Every change re-runs the desired-selection reconcile and refreshes JS.
+- (void)handleTrackListChanged
+{
+  __weak __typeof(self) weakSelf = self;
+  VLCRunOnMain(^{
+    __strong __typeof(weakSelf) strongSelf = weakSelf;
+    if (strongSelf == nil || strongSelf->_destroyed) return;
+    [strongSelf applyTrackSelection];
+    [strongSelf scheduleTracksEmit];
+  });
+}
+
+- (void)mediaPlayerTrackAdded:(NSString *)trackId withType:(VLCMediaTrackType)trackType
+{
+  [self handleTrackListChanged];
+}
+
+- (void)mediaPlayerTrackRemoved:(NSString *)trackId withType:(VLCMediaTrackType)trackType
+{
+  [self handleTrackListChanged];
+}
+
+- (void)mediaPlayerTrackUpdated:(NSString *)trackId withType:(VLCMediaTrackType)trackType
+{
+  [self handleTrackListChanged];
+}
+
+- (void)mediaPlayerTrackSelected:(VLCMediaTrackType)trackType
+                      selectedId:(NSString *)selectedId
+                    unselectedId:(NSString *)unselectedId
+{
+  [self handleTrackListChanged];
+}
+
 // percent <100: in-progress; ≥100: complete. Mirrors Android handleBuffering.
 - (void)handleLibVLCBufferingPercent:(float)percent
 {
@@ -1383,9 +1609,25 @@ static BOOL VLCRouteHasExternalAudioOutput(AVAudioSessionRouteDescription *route
   if (_destroyed) return;
   if (_mediaPlayer == nil) return;
   _lastTimeMs = timeMs < 0 ? 0 : timeMs;
-  int64_t durationMs = _loadedDurationMs;
-  if (durationMs <= 0) return;  // live stream or pre-load
+
+  // Native-side throttle: every emission crosses the bridge, which adds up
+  // fast in multi-player grids. Position restore still sees every tick via
+  // _lastTimeMs above.
+  CFTimeInterval now = CACurrentMediaTime();
+  if (_lastProgressEmitTime > 0 &&
+      (now - _lastProgressEmitTime) * 1000.0 < (double)_progressUpdateIntervalMs) {
+    return;
+  }
+  _lastProgressEmitTime = now;
+
   int64_t safeTime = timeMs < 0 ? 0 : timeMs;
+  int64_t durationMs = _loadedDurationMs;
+  if (durationMs <= 0) {
+    // Live stream: no duration/percent, but elapsed time is still useful
+    // (recording timers, "on air for" displays).
+    [self emitProgressCurrentTime:safeTime duration:0 percent:0.0f];
+    return;
+  }
   float percent = (float)(((double)safeTime / (double)durationMs) * 100.0);
   [self emitProgressCurrentTime:safeTime duration:durationMs percent:percent];
 }

@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Log
 import android.view.PixelCopy
@@ -22,6 +23,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.UIManagerHelper
 import com.facebook.react.uimanager.events.Event
@@ -32,6 +34,7 @@ import java.util.concurrent.Executors
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.interfaces.IMedia
 import org.videolan.libvlc.util.VLCVideoLayout
 
 class VlcPlayerView @JvmOverloads constructor(
@@ -60,9 +63,17 @@ class VlcPlayerView @JvmOverloads constructor(
   private var desiredHardwareEnabled: Boolean = true
   private var desiredReferer: String? = null
   private var desiredUserAgent: String? = null
+  // Track selection: 'auto' (leave libvlc alone), 'none' (disable), or a
+  // stringified TrackDescription id. Desired-tier: survives media reloads.
+  private var desiredAudioTrackId: String = "auto"
+  private var desiredTextTrackId: String = "auto"
+  private var desiredSubtitleUri: String? = null
+  private var progressUpdateIntervalMs: Long = 500
 
   // Internal state
   private var playerSession: PlayerSession? = null
+  // -1 unknown, 0 paused, 1 playing — dedupe for onPlaybackStateChanged.
+  private var lastReportedIsPlaying: Int = -1
   private var attachedToWindow: Boolean = false
   private var resumeWhenActive: Boolean = false
   private var released: Boolean = false
@@ -250,6 +261,36 @@ class VlcPlayerView @JvmOverloads constructor(
     if (resolved == desiredUserAgent) return
     desiredUserAgent = resolved
     if (currentUri != null) pendingApply = true
+  }
+
+  fun setAudioTrackId(value: String?) {
+    if (released) return
+    val resolved = value?.trim()?.takeIf { it.isNotEmpty() } ?: "auto"
+    if (resolved == desiredAudioTrackId) return
+    desiredAudioTrackId = resolved
+    playerSession?.applyTrackSelection()
+  }
+
+  fun setTextTrackId(value: String?) {
+    if (released) return
+    val resolved = value?.trim()?.takeIf { it.isNotEmpty() } ?: "auto"
+    if (resolved == desiredTextTrackId) return
+    desiredTextTrackId = resolved
+    playerSession?.applyTrackSelection()
+  }
+
+  fun setSubtitleUri(value: String?) {
+    if (released) return
+    val resolved = value?.trim()?.takeIf { it.isNotEmpty() }
+    if (resolved == desiredSubtitleUri) return
+    desiredSubtitleUri = resolved
+    // Slaves bind to an input at open time — a change means reloading media.
+    if (currentUri != null) pendingApply = true
+  }
+
+  fun setProgressUpdateInterval(value: Int) {
+    if (released) return
+    progressUpdateIntervalMs = if (value > 0) value.toLong() else 500L
   }
 
   fun setResizeMode(mode: String?) {
@@ -543,6 +584,15 @@ class VlcPlayerView @JvmOverloads constructor(
     emitEvent("topSnapshotResult", map)
   }
 
+  private fun emitPlaybackState(isPlaying: Boolean) {
+    val normalized = if (isPlaying) 1 else 0
+    if (lastReportedIsPlaying == normalized) return
+    lastReportedIsPlaying = normalized
+    val map = Arguments.createMap()
+    map.putBoolean("isPlaying", isPlaying)
+    emitEvent("topPlaybackStateChanged", map)
+  }
+
   private fun emitEvent(eventName: String, payload: WritableMap) {
     val reactContext = context as? ReactContext ?: return
     val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
@@ -571,7 +621,10 @@ class VlcPlayerView @JvmOverloads constructor(
     context: Context,
     private val initOptions: List<String>,
   ) {
-    private val libVlc = LibVLC(context.applicationContext, ArrayList(initOptions))
+    // One process-wide libvlc core per distinct initOptions set (see
+    // LibVlcCorePool) — per-view cores multiply memory and startup cost in
+    // multi-player grids. MediaPlayer stays per-session.
+    private val libVlc = LibVlcCorePool.acquire(context, initOptions)
     private val mediaPlayer = MediaPlayer(libVlc)
 
     private var attached = false
@@ -583,6 +636,11 @@ class VlcPlayerView @JvmOverloads constructor(
     // main-thread-only and emits are called directly from the handlers.
     private var isBufferingState: Boolean = false
     private var hasEmittedLoad: Boolean = false
+    private var hasEmittedPlaying: Boolean = false
+    // Coalesces burst ES events into one tracks emission per loop turn.
+    private var tracksEmitScheduled: Boolean = false
+    // Throttle bookkeeping for onProgress (elapsedRealtime ms).
+    private var lastProgressEmitAt: Long = 0
     // Cached from LengthChanged so per-tick handlers skip the JNI
     // mediaPlayer.length query on every TimeChanged.
     private var cachedLengthMs: Long = 0
@@ -603,6 +661,12 @@ class VlcPlayerView @JvmOverloads constructor(
         MediaPlayer.Event.LengthChanged -> handleLengthChanged(event.lengthChanged)
         MediaPlayer.Event.Vout -> {
           if (event.voutCount > 0) maybeEmitLoad()
+        }
+        MediaPlayer.Event.ESAdded,
+        MediaPlayer.Event.ESDeleted,
+        MediaPlayer.Event.ESSelected -> {
+          applyTrackSelection()
+          scheduleTracksEmit()
         }
       }
     }
@@ -638,13 +702,21 @@ class VlcPlayerView @JvmOverloads constructor(
         emitBuffer(isBuffering = false, percent = 100f)
       }
       maybeEmitLoad()
-      emitPlaying(loadedUri)
+      if (!hasEmittedPlaying) {
+        hasEmittedPlaying = true
+        emitPlaying(loadedUri)
+      }
+      emitPlaybackState(true)
+      applyTrackSelection()
     }
 
-    private fun handlePaused() {}
+    private fun handlePaused() {
+      emitPlaybackState(false)
+    }
 
     private fun handleStopped() {
       isBufferingState = false
+      emitPlaybackState(false)
     }
 
     // libvlc never delivers a TimeChanged at exactly `length` — VOD ends with
@@ -670,8 +742,19 @@ class VlcPlayerView @JvmOverloads constructor(
 
     private fun handleTimeChanged(time: Long) {
       lastTimeMs = time.coerceAtLeast(0L)
-      if (cachedLengthMs <= 0L) return  // live stream — no meaningful progress
+      // Native-side throttle: every emission crosses the bridge, which adds
+      // up fast in multi-player grids. Position restore still sees every
+      // tick via lastTimeMs above.
+      val now = SystemClock.elapsedRealtime()
+      if (lastProgressEmitAt > 0 && now - lastProgressEmitAt < progressUpdateIntervalMs) return
+      lastProgressEmitAt = now
       val safeTime = time.coerceAtLeast(0L)
+      if (cachedLengthMs <= 0L) {
+        // Live stream: no duration/percent, but elapsed time is still useful
+        // (recording timers, "on air for" displays).
+        emitProgress(safeTime, 0L, 0f)
+        return
+      }
       val percent = (safeTime.toFloat() / cachedLengthMs * 100f).coerceIn(0f, 100f)
       emitProgress(safeTime, cachedLengthMs, percent)
     }
@@ -704,6 +787,74 @@ class VlcPlayerView @JvmOverloads constructor(
       emitLoad(cachedLengthMs, w, h)
     }
 
+    // ---- Tracks ----
+
+    // Reconciles desired audio/text selection against the live track lists.
+    // Idempotent and re-entered from prop changes, Playing, and ES events —
+    // tracks appear asynchronously, so a desired id is applied whenever its
+    // track shows up. libvlc lists include a "Disable" pseudo-track (id -1)
+    // which maps to our 'none'.
+    fun applyTrackSelection() {
+      applySelection(desiredAudioTrackId, mediaPlayer.audioTrack) { id ->
+        mediaPlayer.setAudioTrack(id)
+      }
+      applySelection(desiredTextTrackId, mediaPlayer.spuTrack) { id ->
+        mediaPlayer.setSpuTrack(id)
+      }
+    }
+
+    private inline fun applySelection(desired: String, current: Int, select: (Int) -> Unit) {
+      when (desired) {
+        "auto" -> return // don't fight libvlc's default selection
+        "none" -> if (current != -1) runCatching { select(-1) }
+        else -> {
+          val id = desired.toIntOrNull() ?: return
+          if (current != id) runCatching { select(id) }
+        }
+      }
+    }
+
+    private fun scheduleTracksEmit() {
+      if (tracksEmitScheduled) return
+      tracksEmitScheduled = true
+      post {
+        tracksEmitScheduled = false
+        emitTracksNow()
+      }
+    }
+
+    private fun emitTracksNow() {
+      if (released) return
+      val payload = Arguments.createMap()
+      payload.putArray("audioTracks", describeTracks(
+        runCatching { mediaPlayer.audioTracks }.getOrNull(),
+        runCatching { mediaPlayer.audioTrack }.getOrDefault(-1),
+      ))
+      payload.putArray("textTracks", describeTracks(
+        runCatching { mediaPlayer.spuTracks }.getOrNull(),
+        runCatching { mediaPlayer.spuTrack }.getOrDefault(-1),
+      ))
+      emitEvent("topTracksChanged", payload)
+    }
+
+    private fun describeTracks(
+      tracks: Array<MediaPlayer.TrackDescription>?,
+      currentId: Int,
+    ): WritableArray {
+      val array = Arguments.createArray()
+      tracks?.forEach { track ->
+        if (track.id == -1) return@forEach // libvlc's "Disable" pseudo-track
+        val map = Arguments.createMap()
+        map.putString("id", track.id.toString())
+        map.putString("name", track.name ?: "")
+        // TrackDescription carries no language; the name usually embeds it.
+        map.putString("language", "")
+        map.putBoolean("selected", track.id == currentId)
+        array.pushMap(map)
+      }
+      return array
+    }
+
     // ---- Public API ----
 
     fun matches(init: List<String>): Boolean = initOptions == init
@@ -717,6 +868,8 @@ class VlcPlayerView @JvmOverloads constructor(
       loadedUri = uri
       playWhenAttached = autoPlay
       hasEmittedLoad = false
+      hasEmittedPlaying = false
+      lastReportedIsPlaying = -1
       isBufferingState = false
       cachedLengthMs = 0
 
@@ -754,6 +907,13 @@ class VlcPlayerView @JvmOverloads constructor(
       // so the source-object form wins over a manual `mediaOptions` override.
       desiredReferer?.let { media.addOption(":http-referrer=$it") }
       desiredUserAgent?.let { media.addOption(":http-user-agent=$it") }
+      // External subtitle as a media-level slave — part of the media from
+      // the start, like desktop VLC's "load subtitle file". Priority 4
+      // (user) makes libvlc auto-select it over container defaults.
+      desiredSubtitleUri?.let { uri ->
+        runCatching { media.addSlave(IMedia.Slave(IMedia.Slave.Type.Subtitle, 4, uri)) }
+          .onFailure { Log.w(TAG, "addSlave failed for $uri: ${it.message}") }
+      }
 
       mediaPlayer.media = media
       media.release()
@@ -834,7 +994,9 @@ class VlcPlayerView @JvmOverloads constructor(
       detach()
       mediaPlayer.setEventListener(null)
       mediaPlayer.release()
-      libVlc.release()
+      // The LibVLC core is shared and pooled for the process lifetime
+      // (LibVlcCorePool) — matching the official VLC-Android app's
+      // process-wide core. Do NOT release it here.
     }
   }
 
@@ -859,6 +1021,21 @@ class VlcPlayerView @JvmOverloads constructor(
         else -> CONTAIN
       }
     }
+  }
+
+  // Process-wide libvlc cores, keyed by their constructor options. A core is
+  // a whole libvlc instance; the official VLC-Android app runs exactly one
+  // for the entire process. Cores live until process death — apps use a
+  // handful of distinct option sets at most.
+  private object LibVlcCorePool {
+    private val cores = HashMap<List<String>, LibVLC>()
+
+    @Synchronized
+    fun acquire(context: Context, options: List<String>): LibVLC =
+      cores.getOrPut(options.toList()) {
+        Log.i(TAG, "Creating shared LibVLC core for initOptions [${options.joinToString(", ")}]")
+        LibVLC(context.applicationContext, ArrayList(options))
+      }
   }
 
   private companion object {
