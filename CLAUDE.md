@@ -47,7 +47,8 @@ Pre-commit (lefthook) runs `eslint` on staged JS/TS and a full `tsc`. Commit mes
 1. Translate codegen event shapes (flat `videoWidth`/`videoHeight`) to the public API (nested `videoSize: {width, height}`) — the public types in `VlcPlayerView.types.ts` are what consumers see.
 2. Normalize the public `source: string | { uri, referer?, userAgent? }` prop into the flat codegen fields `url` / `referer` / `userAgent`. Native sees three separate primitives, not a union — keeping codegen simple. `Referer` and `User-Agent` are the *only* HTTP headers libvlc can inject (its HTTP access module reads `http-referrer` and `http-user-agent` and nothing else); arbitrary headers like `Authorization` are not supported.
 3. Expose imperative methods via `useImperativeHandle` that dispatch through `Commands.*` from codegen.
-4. Implement `snapshot()` as a Promise: each call gets a unique `callId`, the native side replies via the `onSnapshotResult` event, and JS resolves the matching entry from a `Map<callId, {resolve, reject}>`. Pending promises are rejected on unmount. **`onSnapshotResult` is internal — never surface it as a public prop.**
+4. **Passthrough-first**: wire shape == public shape by design, so everything flows through `{...rest}` untouched — the wrapper only intercepts `source` normalization and the internal `onSnapshotResult`. Events keep RN's standard `{nativeEvent}` convention. When adding API, match the public shape to the wire shape so no new interception is ever needed.
+5. Implement `snapshot()` as a Promise: each call gets a unique `callId`, the native side replies via the `onSnapshotResult` event, and JS resolves the matching entry from a `Map<callId, {resolve, reject}>`. Pending promises are rejected on unmount. **`onSnapshotResult` is internal — never surface it as a public prop.**
 
 ### Native lifecycle pattern (both platforms)
 
@@ -63,6 +64,8 @@ Prop setters update only desired state and set a `pendingApply` flag. Reconcilia
 - Android: `VlcPlayerViewManager.onAfterUpdateTransaction` → `view.applyPendingChanges()`.
 
 When extending state, follow this split — don't call into VLCKit/libvlc from a prop setter directly.
+
+Track selection (`audioTrack`/`textTrack`, `'auto' | 'none' | id`) is deliberately **declarative**: tracks resolve asynchronously and media reloads are frequent (repeat/hardwareDecoding toggles, recovery), so natives re-reconcile the desired id whenever tracks appear/change (iOS track delegate callbacks; Android ES events) and on every Playing transition. `subtitleUri` is media-defining (reload on change); the slave is added once per media on the first Playing transition (libvlc requires a running input). `onPlaybackStateChanged` is the play/pause ground truth (deduped natively) — native-initiated pauses never mutate the `paused` prop. `onProgress` is throttled natively by `progressUpdateInterval`; live streams (duration 0) still emit `currentTime`. Both platforms pool libvlc cores per distinct `initOptions` for the process lifetime (multi-player grids would otherwise pay one full core per view).
 
 ### iOS specifics (`ios/VlcPlayerView.mm`)
 

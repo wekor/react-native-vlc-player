@@ -24,7 +24,7 @@ npm install @wekor/react-native-vlc-player
 cd ios && pod install
 ```
 
-Requires React Native 0.74+ with the New Architecture enabled.
+Requires React Native 0.80+ with the New Architecture enabled.
 
 ---
 
@@ -58,7 +58,7 @@ const [loading, setLoading] = useState(true);
 <View>
   <VlcPlayerView
     source={url}
-    onBuffer={({ isBuffering }) => setLoading(isBuffering)}
+    onBuffer={({ nativeEvent: { isBuffering } }) => setLoading(isBuffering)}
   />
   {loading && <ActivityIndicator style={StyleSheet.absoluteFill} />}
 </View>
@@ -73,7 +73,7 @@ const ref = useRef<VlcPlayerHandle>(null);
 <VlcPlayerView
   ref={ref}
   source={url}
-  onProgress={setProgress}
+  onProgress={(e) => setProgress(e.nativeEvent)}
 />
 <Slider
   value={progress.currentTime}
@@ -107,28 +107,71 @@ const ref = useRef<VlcPlayerHandle>(null);
 | `muted` | `boolean` | `false` | Mute audio |
 | `volume` | `number` | `1` | Volume, 0..1 |
 | `rate` | `number` | `1` | Playback rate (1 = normal). Changing it does not reload the media. VOD only — live streams and some protocols ignore the request. |
-| `repeat` | `boolean` | `false` | Loop playback (VOD). Toggling it reloads the media and restarts from the beginning, like `hardwareDecoding`. See the `onEnd` note below for per-platform loop behavior. |
+| `repeat` | `boolean` | `false` | Loop playback (VOD). Toggling it reloads the media; the playback position is preserved. See the `onEnd` note below for per-platform loop behavior. |
 | `resizeMode` | `'contain' \| 'cover' \| 'stretch' \| 'original'` | `'contain'` | Scaling mode |
 | `hardwareDecoding` | `boolean` | `true` | Toggle hardware video decoding. Set `false` to force software decoding when the HW decoder produces artifacts. |
 | `initOptions` | `string[]` | `[]` | libvlc instance options, e.g. `['--rtsp-tcp']` |
 | `mediaOptions` | `string[]` | `[]` | libvlc media options, e.g. `[':network-caching=200']` |
+| `audioTrack` | `string` | `'auto'` | Audio track selection: `'auto'`, `'none'`, or a track id from `onTracksChanged`. Survives media reloads. |
+| `textTrack` | `string` | `'auto'` | Subtitle track selection: `'auto'`, `'none'`, or a track id from `onTracksChanged`. |
+| `subtitleUri` | `string` | — | External subtitle file (`file://` or `http(s)://`, e.g. `.srt`). Loaded with the media and auto-selected. |
+| `progressUpdateInterval` | `number` | `500` | Minimum ms between `onProgress` events (native-side throttle — raise it for multi-player grids). |
 
 ## Events
 
 | Event | When it fires | Payload |
 |---|---|---|
-| `onLoad` | Metadata parsed, before the first frame | `{ duration, videoSize: { width, height } }` |
-| `onPlaying` | First frame rendered | — |
+| `onLoad` | Metadata parsed, before the first frame (once per media) | `{ duration, videoWidth, videoHeight }` |
+| `onPlaying` | First frame rendered (once per media) | — |
+| `onPlaybackStateChanged` | Play/pause ground truth — includes native-initiated pauses (phone call, headphones unplugged, backgrounding) that the `paused` prop can't know about | `{ isPlaying }` |
 | `onBuffer` | Buffering state changes (startup + stalls) | `{ isBuffering, percent }` |
-| `onProgress` | Playback progress (every 500ms, VOD only) | `{ currentTime, duration, percent }` |
+| `onProgress` | Playback progress. Live streams report `currentTime` with `duration: 0` | `{ currentTime, duration, percent }` |
 | `onEnd` | Playback finished (VOD) | — |
 | `onError` | Playback error | `{ message }` |
+| `onTracksChanged` | Available audio/subtitle tracks changed (tracks resolve asynchronously after playback starts) | `{ audioTracks: Track[], textTracks: Track[] }`, each `{ id, name, language, selected }` |
 
 Notes:
 - `duration` / `currentTime` are in milliseconds.
 - In `onBuffer`, `percent` is the buffer fill 0..100; in `onProgress` it's the playback progress 0..100.
 - With `repeat` enabled, loop behavior differs per platform: Android loops seamlessly inside libvlc and fires no per-loop events; iOS (VLCKit 4 alpha) briefly reloads between passes and fires `onEnd` each pass. Don't rely on `onEnd` for loop counting.
-- The player follows platform audio conventions automatically: it pauses when headphones (wired or Bluetooth) disconnect and on audio interruptions (phone calls, alarms; audio-focus loss on Android). After an interruption it resumes only when the OS says it should (iOS `ShouldResume` / Android transient-focus regain); it never auto-resumes after a headphone unplug. These native pauses do not mutate the `paused` prop.
+- The player follows platform audio conventions automatically: it pauses when headphones (wired or Bluetooth) disconnect and on audio interruptions (phone calls, alarms; audio-focus loss on Android). After an interruption it resumes only when the OS says it should (iOS `ShouldResume` / Android transient-focus regain); it never auto-resumes after a headphone unplug. These native pauses do not mutate the `paused` prop — listen to `onPlaybackStateChanged` for the ground truth.
+
+### Track selection & subtitles
+
+```tsx
+const [tracks, setTracks] = useState({ audioTracks: [], textTracks: [] });
+const [audioTrack, setAudioTrack] = useState('auto');
+const [textTrack, setTextTrack] = useState('auto');
+
+<VlcPlayerView
+  source={url}
+  audioTrack={audioTrack}                    // 'auto' | 'none' | track id
+  textTrack={textTrack}
+  subtitleUri="file:///path/to/movie.srt"    // optional external subtitle
+  onTracksChanged={(e) => setTracks(e.nativeEvent)}
+/>
+
+// Render a menu from tracks.audioTracks / tracks.textTracks and feed the
+// chosen id back into the prop. Subtitles are rendered by libvlc inside
+// the video — no overlay work needed.
+```
+
+Prefer a language over an explicit track? Skip the props and let libvlc pick
+by preference:
+
+```tsx
+<VlcPlayerView source={url} mediaOptions={[':audio-language=zh', ':sub-language=zh']} />
+```
+
+Notes:
+- **Subtitles are usually off under `'auto'`** — like desktop VLC, libvlc only
+  auto-enables a text track when the container marks one as default or a
+  language preference matches. Select a track id (or set `:sub-language=`)
+  to show subtitles.
+- **HLS track ids are not stable**: switching a rendition can tear down and
+  recreate its track under a new id. Rebuild your menu from every
+  `onTracksChanged` and re-resolve any id you held onto (embedded tracks in
+  MP4/MKV don't have this problem).
 
 ## Imperative methods (ref)
 
@@ -201,22 +244,6 @@ Do not also pass `:codec=...` or `:no-hw-dec` in `mediaOptions` — the two
 platforms use different underlying option strings and your override will be
 clobbered.
 
-### Black screen after returning from background (iOS)
-
-A VLCKit platform limitation — the official VLC iOS app shows the same
-behavior (audio resumes, video stays black; media reloads and video-track
-toggling were both tried and don't recover the vout). Recommended workaround:
-reload on foreground from JS:
-
-```tsx
-useEffect(() => {
-  const sub = AppState.addEventListener('change', (s) => {
-    if (s === 'active') ref.current?.reload();
-  });
-  return () => sub.remove();
-}, []);
-```
-
 ### Audio only (or video only)
 
 ```tsx
@@ -253,7 +280,7 @@ match an allowlisted domain. Pass `Referer` via the source object:
 
 ## Requirements
 
-React Native 0.74+ with the New Architecture (Fabric) enabled. iOS 15.1+, Android 7.0+.
+React Native 0.80+ with the New Architecture (Fabric) enabled. iOS 15.1+, Android 7.0+.
 
 The legacy bridge is not supported — use [react-native-vlc-media-player](https://github.com/razorRun/react-native-vlc-media-player) on the old architecture.
 
