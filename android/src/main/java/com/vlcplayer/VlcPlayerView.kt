@@ -75,7 +75,10 @@ class VlcPlayerView @JvmOverloads constructor(
   // -1 unknown, 0 paused, 1 playing — dedupe for onPlaybackStateChanged.
   private var lastReportedIsPlaying: Int = -1
   private var attachedToWindow: Boolean = false
-  private var resumeWhenActive: Boolean = false
+  // Position handover across the background stop/rebuild cycle (the session
+  // dies with the background, official-app style savedTime lives up here).
+  private var savedResumeUri: Uri? = null
+  private var savedResumeMs: Long = 0
   private var released: Boolean = false
   private var pendingApply: Boolean = false
 
@@ -85,6 +88,7 @@ class VlcPlayerView @JvmOverloads constructor(
   }
   // Reused by PixelCopy.request to avoid a Handler alloc per snapshot.
   private val mainHandler = Handler(Looper.getMainLooper())
+
 
   // ---- Audio session behaviors (platform convention, parity with iOS) ----
 
@@ -386,7 +390,6 @@ class VlcPlayerView @JvmOverloads constructor(
     released = true
     shouldPlayWhenReady = false
     attachedToWindow = false
-    resumeWhenActive = false
     pendingApply = false
     removeCallbacks(measureAndLayoutRunnable)
     ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
@@ -437,21 +440,34 @@ class VlcPlayerView @JvmOverloads constructor(
 
   override fun onStop(owner: LifecycleOwner) {
     if (released) return
-    resumeWhenActive = playerSession?.isPlaying() == true
-    playerSession?.pause()
-    playerSession?.detach()
+    // Official VLC-Android parity: no resurrection. Backgrounding stops
+    // playback outright — the system reclaims the codec and surface anyway
+    // (device-verified) and every revival heuristic we tried could be lied
+    // to. Foregrounding rebuilds from the saved position instead.
+    captureResumeState()
+    playerSession?.release()
+    playerSession = null
   }
 
   override fun onStart(owner: LifecycleOwner) {
     if (released) return
-    if (attachedToWindow) {
-      playerSession?.attach(videoLayout)
-    }
-    val shouldResume = resumeWhenActive || shouldPlayWhenReady
-    resumeWhenActive = false
-    if (shouldResume && attachedToWindow && currentUri != null) {
-      playerSession?.playWhenReady()
-    }
+    if (!attachedToWindow || currentUri == null) return
+    pendingApply = true
+    applyPendingChanges()
+  }
+
+  // Official-app rules: never resume into the last 5 seconds; rewind 2
+  // seconds to compensate perceived loading time. Live streams (no length)
+  // reconnect fresh.
+  private fun captureResumeState() {
+    savedResumeUri = null
+    savedResumeMs = 0
+    val session = playerSession ?: return
+    val time = session.currentTimeMs()
+    val length = session.lengthMs()
+    if (time <= 0L || length <= 0L || length - time < 5000) return
+    savedResumeUri = currentUri
+    savedResumeMs = (time - 2000).coerceAtLeast(0)
   }
 
   // ============================================================
@@ -859,11 +875,22 @@ class VlcPlayerView @JvmOverloads constructor(
 
     fun matches(init: List<String>): Boolean = initOptions == init
 
+    fun currentTimeMs(): Long = lastTimeMs
+
+    fun lengthMs(): Long = cachedLengthMs
+
     fun prepare(uri: Uri, mediaOptions: List<String>, autoPlay: Boolean) {
       Log.i(TAG, "Loading media ${redactUri(uri)} with mediaOptions [${mediaOptions.joinToString(", ")}]")
       // Same-URI reload continues at the previous position; a new source
-      // starts clean at zero.
-      pendingRestoreMs = if (uri == loadedUri && lastTimeMs > 1500) lastTimeMs else 0
+      // starts clean at zero. A fresh session consumes the background
+      // handover (savedResume*) captured when the previous session died.
+      pendingRestoreMs = when {
+        uri == loadedUri && lastTimeMs > 1500 -> lastTimeMs
+        loadedUri == null && uri == savedResumeUri && savedResumeMs > 1500 -> savedResumeMs
+        else -> 0
+      }
+      savedResumeUri = null
+      savedResumeMs = 0
       if (pendingRestoreMs == 0L) lastTimeMs = 0
       loadedUri = uri
       playWhenAttached = autoPlay
@@ -990,13 +1017,23 @@ class VlcPlayerView @JvmOverloads constructor(
       runCatching { mediaPlayer.isPlaying }.getOrDefault(false)
 
     fun release() {
-      stop()
+      // stop() blocks until libvlc tears the input down — on a dead network
+      // session that means waiting out network timeouts, which froze the UI
+      // when called on the main thread (the official app guards the same
+      // path with a stop timeout). Detach the views here, then let a
+      // teardown thread absorb the blocking part. The shared LibVLC core
+      // (LibVlcCorePool) is never released.
       detach()
       mediaPlayer.setEventListener(null)
-      mediaPlayer.release()
-      // The LibVLC core is shared and pooled for the process lifetime
-      // (LibVlcCorePool) — matching the official VLC-Android app's
-      // process-wide core. Do NOT release it here.
+      abandonAudioFocus()
+      teardownExecutor.execute {
+        runCatching { mediaPlayer.stop() }
+        runCatching {
+          mediaPlayer.media?.release()
+          mediaPlayer.media = null
+        }
+        runCatching { mediaPlayer.release() }
+      }
     }
   }
 
@@ -1040,5 +1077,9 @@ class VlcPlayerView @JvmOverloads constructor(
 
   private companion object {
     private const val TAG = "VlcPlayerView"
+    // Serializes blocking libvlc teardowns off the main thread.
+    private val teardownExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+      Thread(r, "VlcPlayerView-Teardown").apply { isDaemon = true }
+    }
   }
 }
