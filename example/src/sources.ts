@@ -11,14 +11,14 @@ export type TestSource = {
 
 export const SOURCES: TestSource[] = [
   {
-    name: 'RTSP (本机摄像头)',
-    url: 'rtsp://172.27.1.52:50001/live/0',
-    note: '直播源,视频尺寸可能从未被报告;0.5.0 新增:currentTime 应持续走字',
-  },
-  {
     name: 'MP4 / HTTPS',
     url: 'https://www.w3schools.com/Html/mov_bbb.mp4',
     note: 'VOD 标准用例，应能拿到 duration，onProgress 持续触发',
+  },
+  {
+    name: 'RTSP (本机摄像头)',
+    url: 'rtsp://172.27.1.52:50001/live/0',
+    note: '直播源,视频尺寸可能从未被报告;0.5.0 新增:currentTime 应持续走字',
   },
   {
     name: 'HLS m3u8',

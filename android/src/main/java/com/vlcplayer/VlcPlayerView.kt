@@ -389,15 +389,25 @@ class VlcPlayerView @JvmOverloads constructor(
     if (released) return
     released = true
     shouldPlayWhenReady = false
-    attachedToWindow = false
     pendingApply = false
     removeCallbacks(measureAndLayoutRunnable)
     ProcessLifecycleOwner.get().lifecycle.removeObserver(this)
     runCatching { context.unregisterReceiver(becomingNoisyReceiver) }
     abandonAudioFocus()
+    currentUri = null
+    if (attachedToWindow) {
+      // Still on screen: the popped screen keeps drawing until its exit
+      // animation ends, and libvlc teardown paints the live surface black
+      // (vlc ClearSurface). Freeze the frame; finish in onDetachedFromWindow.
+      playerSession?.pause()
+      return
+    }
+    finishRelease()
+  }
+
+  private fun finishRelease() {
     playerSession?.release()
     playerSession = null
-    currentUri = null
     snapshotExecutor.shutdown()
   }
 
@@ -430,10 +440,13 @@ class VlcPlayerView @JvmOverloads constructor(
   }
 
   override fun onDetachedFromWindow() {
-    if (!released) {
+    attachedToWindow = false
+    if (released) {
+      // Deferred from release(); children detach first, the surface is dead.
+      finishRelease()
+    } else {
       playerSession?.pause()
       playerSession?.detach()
-      attachedToWindow = false
     }
     super.onDetachedFromWindow()
   }
@@ -610,6 +623,8 @@ class VlcPlayerView @JvmOverloads constructor(
   }
 
   private fun emitEvent(eventName: String, payload: WritableMap) {
+    // The session briefly outlives onDropViewInstance — no events after that.
+    if (released) return
     val reactContext = context as? ReactContext ?: return
     val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
     val surfaceId = UIManagerHelper.getSurfaceId(this)
