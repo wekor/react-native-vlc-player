@@ -104,13 +104,9 @@ Our pre-commit hooks verify that your commit message matches this format when co
 
 ### Publishing to npm
 
-We use [release-it](https://github.com/release-it/release-it) to make it easier to publish new versions. It handles common tasks like bumping version based on semver, creating tags and releases etc.
+Releases are automated with [release-please](https://github.com/googleapis/release-please). On every push to `master` it opens (or updates) a release PR that bumps the version and updates `CHANGELOG.md` from the Conventional Commits since the last release.
 
-To publish new versions, run the following:
-
-```sh
-yarn release
-```
+To publish, merge that PR. The `Release` workflow (`.github/workflows/publish.yml`) then tags `vX.Y.Z`, creates the GitHub release, and publishes to npm via Trusted Publishing. Nothing runs locally.
 
 
 ### Scripts
