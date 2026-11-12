@@ -18,6 +18,7 @@ From the repo root:
 - `yarn test` — Jest (preset `@react-native/jest-preset`). Single test: `yarn test path/to/file.test.tsx -t 'name'`
 - `yarn prepare` — `bob build`; produces `lib/module/` (ESM) + `lib/typescript/`. This is what consumers import.
 - `yarn clean` — `del-cli lib`
+- Changes go through a branch + PR, squash-merged into `master`; the PR title becomes the commit message, so it must be a Conventional Commit (`PR title` workflow checks it). CI runs on PRs only.
 - Releases: no local command. release-please (`.github/workflows/publish.yml`) keeps a release PR open on `master` built from conventional commits; merging it tags, creates the GitHub release, and publishes to npm via Trusted Publishing
 
 Example app (must be used to verify native changes; JS changes hot-reload):

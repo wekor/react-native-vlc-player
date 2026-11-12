@@ -104,9 +104,22 @@ Our pre-commit hooks verify that your commit message matches this format when co
 
 ### Publishing to npm
 
-Releases are automated with [release-please](https://github.com/googleapis/release-please). On every push to `master` it opens (or updates) a release PR that bumps the version and updates `CHANGELOG.md` from the Conventional Commits since the last release.
+Every change reaches `master` through a squash-merged pull request:
 
-To publish, merge that PR. The `Release` workflow (`.github/workflows/publish.yml`) then tags `vX.Y.Z`, creates the GitHub release, and publishes to npm via Trusted Publishing. Nothing runs locally.
+```sh
+git switch master && git pull
+git switch -c fix/short-description      # or feat/…
+# commit with a Conventional Commit message, e.g. "fix(android): …"
+git push -u origin fix/short-description
+gh pr create --fill
+# wait for CI to pass, then "Squash and merge"
+```
+
+The squash commit takes the **PR title** as its message, so the title must follow Conventional Commits too (the `PR title` check enforces it). Merging a PR does not publish anything.
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please). Every merge to `master` opens (or updates) a release PR titled `chore(master): release X.Y.Z`, which bumps the version and updates `CHANGELOG.md` from the Conventional Commits since the last release: `fix` → patch, `feat` → minor (breaking changes also bump minor while we're on 0.x).
+
+To publish, merge that release PR. The `Release` workflow (`.github/workflows/publish.yml`) then tags `vX.Y.Z`, creates the GitHub release, and publishes to npm via Trusted Publishing. Nothing runs locally. CI skips the release PR, since it only changes the version and changelog.
 
 
 ### Scripts
