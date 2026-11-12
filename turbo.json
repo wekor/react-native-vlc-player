@@ -6,16 +6,20 @@
     "build:android": {
       "env": ["ANDROID_HOME", "ORG_GRADLE_PROJECT_newArchEnabled"],
       "inputs": [
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/yarn.lock",
+        "$TURBO_ROOT$/src/**",
+        "!$TURBO_ROOT$/src/__tests__/**",
+        "$TURBO_ROOT$/android/**",
+        "!$TURBO_ROOT$/android/build/**",
         "package.json",
-        "android",
-        "!android/build",
-        "src/*.ts",
-        "src/*.tsx",
-        "example/package.json",
-        "example/android",
-        "!example/android/.gradle",
-        "!example/android/build",
-        "!example/android/app/build"
+        "app.json",
+        "app/**",
+        "src/**",
+        "assets/**",
+        "babel.config.js",
+        "metro.config.js",
+        "react-native.config.js"
       ],
       "outputs": []
     },
@@ -27,15 +31,20 @@
         "RCT_USE_PREBUILT_RNCORE"
       ],
       "inputs": [
+        "$TURBO_ROOT$/package.json",
+        "$TURBO_ROOT$/yarn.lock",
+        "$TURBO_ROOT$/src/**",
+        "!$TURBO_ROOT$/src/__tests__/**",
+        "$TURBO_ROOT$/ios/**",
+        "$TURBO_ROOT$/*.podspec",
         "package.json",
-        "*.podspec",
-        "ios",
-        "src/*.ts",
-        "src/*.tsx",
-        "example/package.json",
-        "example/ios",
-        "!example/ios/build",
-        "!example/ios/Pods"
+        "app.json",
+        "app/**",
+        "src/**",
+        "assets/**",
+        "babel.config.js",
+        "metro.config.js",
+        "react-native.config.js"
       ],
       "outputs": []
     }
