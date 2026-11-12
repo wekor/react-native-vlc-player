@@ -1,11 +1,18 @@
 name: CI
+# Changes land on master through squash-merged PRs, so CI runs on the PR only;
+# re-running it on the merge commit would test the same tree twice.
 on:
-  push:
-    branches:
-      - master
   pull_request:
     branches:
       - master
+    # release-please's release PR touches only these files (version bump +
+    # changelog). Skipping it avoids a full native rebuild for a version bump,
+    # and the run GitHub would otherwise hold for approval because a bot opened
+    # the PR. Caveat: a PR that changes nothing but these files skips CI too.
+    paths-ignore:
+      - CHANGELOG.md
+      - .release-please-manifest.json
+      - package.json
   merge_group:
     types:
       - checks_requested
