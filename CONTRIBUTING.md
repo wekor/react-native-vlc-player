@@ -117,6 +117,14 @@ gh pr create --fill
 
 The squash commit takes the **PR title** as its message, so the title must follow Conventional Commits too (the `PR title` check enforces it). Merging a PR does not publish anything.
 
+CI runs on pull requests only, split by platform so a PR only waits for what it touches:
+
+- `ci.yml` (every PR): lint, type check, unit tests, the library build and the web build.
+- `android.yml` (when `android/` or a shared path changes): the example's Android build.
+- `ios.yml` (when `ios/`, the podspec or a shared path changes): the example's iOS build.
+
+Shared paths are `src/` (except `src/__tests__/`), `example/`, `yarn.lock`, the Yarn and Node versions, `turbo.json` and the CI setup; keep the lists in `android.yml` and `ios.yml` in sync. Turbo caches each native build across pushes to the same PR.
+
 Releases are automated with [release-please](https://github.com/googleapis/release-please). Every merge to `master` opens (or updates) a release PR titled `chore(master): release X.Y.Z`, which bumps the version and updates `CHANGELOG.md` from the Conventional Commits since the last release: `fix` → patch, `feat` → minor (breaking changes also bump minor while we're on 0.x).
 
 To publish, merge that release PR. The `Release` workflow (`.github/workflows/publish.yml`) then tags `vX.Y.Z`, creates the GitHub release, and publishes to npm via Trusted Publishing. Nothing runs locally. CI skips the release PR, since it only changes the version and changelog.
